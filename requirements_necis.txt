@@ -1,0 +1,9 @@
+# NECIS downloader dependencies
+# Install into the pipeline env (or a new env):
+#   pip install -r requirements_necis.txt
+#   playwright install chromium
+
+playwright>=1.44
+pandas>=2.0
+obspy>=1.4
+requests>=2.28

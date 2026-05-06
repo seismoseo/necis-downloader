@@ -1,0 +1,221 @@
+"""
+Utilities: unzip and organize NECIS miniSEED downloads.
+
+After fetch_downloads saves ZIP files, this module:
+  1. Extracts them (flat — strips any internal directory structure)
+  2. Organizes miniSEED files into a date-based directory tree
+
+Continuous layout:  out_root/YYYY/MM/DD/NET.STA.LOC.CHA.YYYY.DDD[.mseed]
+Events layout:      out_root/<event_id>/NET.STA.LOC.CHA...
+
+Date is parsed from SEED-style filenames (NET.STA.LOC.CHA.YYYY.DDD pattern).
+If the filename doesn't match, file mtime is used as a fallback.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import shutil
+import zipfile
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+# Matches NECIS filenames: NET.STA.CHA.YYYY.DDD[.HH.MM.SS]
+# Location code is absent in NECIS output (e.g. KS.ADOA.HGZ.2026.125.00.00.00).
+# Also handles the standard SEED variant with location: NET.STA.LOC.CHA.YYYY.DDD.
+_SEED_PAT = re.compile(
+    r"^[A-Z0-9]{1,2}\."          # network
+    r"[A-Z0-9]{3,5}\."           # station
+    r"(?:[A-Z0-9]{0,2}\.)?"      # location (optional — absent in NECIS files)
+    r"[A-Z0-9]{2,3}\."           # channel (2- or 3-char)
+    r"(?P<year>\d{4})\."         # year
+    r"(?P<jday>\d{3})",          # Julian day
+    re.IGNORECASE,
+)
+
+
+def _jday_to_date(year: int, jday: int) -> Optional[datetime]:
+    try:
+        return datetime(year, 1, 1) + timedelta(days=jday - 1)
+    except (ValueError, OverflowError):
+        return None
+
+
+def extract_zips(
+    zip_dir: Path,
+    out_dir: Path,
+    delete_zip: bool = False,
+) -> list[Path]:
+    """Extract all *.zip files from zip_dir into out_dir (flat layout).
+
+    Parameters
+    ----------
+    zip_dir    : directory containing downloaded .zip files
+    out_dir    : destination directory for extracted files
+    delete_zip : remove the .zip after successful extraction
+
+    Returns
+    -------
+    List of extracted file paths.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    extracted: list[Path] = []
+    zip_files = sorted(zip_dir.glob("*.zip"))
+
+    if not zip_files:
+        logger.info("No zip files found in %s", zip_dir)
+        return []
+
+    for zp in zip_files:
+        logger.info("Extracting %s …", zp.name)
+        try:
+            with zipfile.ZipFile(zp) as zf:
+                for member in zf.namelist():
+                    fname = Path(member).name
+                    if not fname:
+                        continue  # skip directory entries
+                    dest = out_dir / fname
+                    if dest.exists():
+                        logger.debug("  skip (exists): %s", fname)
+                        extracted.append(dest)
+                        continue
+                    dest.write_bytes(zf.read(member))
+                    extracted.append(dest)
+                    logger.debug("  → %s", fname)
+            if delete_zip:
+                zp.unlink()
+                logger.info("Removed zip: %s", zp.name)
+        except zipfile.BadZipFile as e:
+            logger.error("Bad zip %s: %s", zp, e)
+        except Exception as e:
+            logger.error("Error extracting %s: %s", zp, e)
+
+    logger.info("Extracted %d file(s) from %d zip(s)", len(extracted), len(zip_files))
+    return extracted
+
+
+def organize_continuous(
+    mseed_dir: Path,
+    out_root: Path,
+    move: bool = False,
+) -> list[Path]:
+    """Organize miniSEED files into out_root/YYYY/STA/ tree.
+
+    Filename format expected: NET.STA.CHA.YYYY.DDD[.HH.MM.SS]
+    e.g. KS.ADOA.HGZ.2026.125.00.00.00 → out_root/2026/ADOA/KS.ADOA.HGZ.2026.125.00.00.00
+
+    Parameters
+    ----------
+    mseed_dir : flat directory of extracted miniSEED files
+    out_root  : output root, e.g. Path("/home/msseo/works/Claude/data/necis/continuous")
+    move      : if True, move rather than copy (saves disk space)
+
+    Returns
+    -------
+    List of organized destination paths.
+    """
+    organized: list[Path] = []
+
+    for src in sorted(mseed_dir.iterdir()):
+        if src.is_dir():
+            continue
+
+        parts = src.name.split(".")
+        m = _SEED_PAT.match(src.name)
+
+        year: Optional[int] = int(m.group("year")) if m else None
+        station: Optional[str] = parts[1] if len(parts) >= 2 else None
+
+        if year is None or station is None:
+            logger.warning("Cannot parse year/station from '%s' — skipping", src.name)
+            continue
+
+        dest_dir = out_root / str(year) / station
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / src.name
+
+        if dest.exists():
+            logger.debug("Skip (exists): %s", dest)
+            organized.append(dest)
+            continue
+
+        if move:
+            shutil.move(str(src), dest)
+        else:
+            shutil.copy2(src, dest)
+
+        logger.debug("%s → %s", src.name, dest)
+        organized.append(dest)
+
+    return organized
+
+
+def organize_events(
+    mseed_dir: Path,
+    out_root: Path,
+    event_id: str,
+    move: bool = False,
+) -> list[Path]:
+    """Organize event waveform files into out_root/event_id/.
+
+    Parameters
+    ----------
+    mseed_dir : flat directory of extracted files for one event
+    out_root  : output root, e.g. Path("/data/events")
+    event_id  : KMA event ID (used as subdirectory name)
+    move      : move rather than copy
+
+    Returns
+    -------
+    List of organized destination paths.
+    """
+    dest_dir = out_root / event_id
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    organized: list[Path] = []
+
+    for src in sorted(mseed_dir.iterdir()):
+        if src.is_dir():
+            continue
+        dest = dest_dir / src.name
+        if dest.exists():
+            organized.append(dest)
+            continue
+        if move:
+            shutil.move(str(src), dest)
+        else:
+            shutil.copy2(src, dest)
+        organized.append(dest)
+
+    return organized
+
+
+def process_continuous_downloads(
+    zip_dir: Path,
+    out_root: Path,
+    move: bool = True,
+    delete_zip: bool = False,
+) -> list[Path]:
+    """Full pipeline: extract zips then organize into out_root/YYYY/MM/DD/.
+
+    Used by download_continuous.py after the fetch step.
+    """
+    staging = zip_dir / "_staging"
+    extracted = extract_zips(zip_dir, staging, delete_zip=delete_zip)
+    if not extracted:
+        logger.info("No files extracted — nothing to organize.")
+        return []
+
+    organized = organize_continuous(staging, out_root, move=move)
+
+    if move and staging.exists():
+        try:
+            staging.rmdir()
+        except OSError:
+            pass
+
+    logger.info("Organized %d miniSEED file(s) into %s", len(organized), out_root)
+    return organized

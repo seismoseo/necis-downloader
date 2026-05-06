@@ -1,0 +1,33 @@
+# Credentials — never commit
+.env
+
+# Runtime data and logs
+data/
+logs/
+
+# NECIS debug artifacts (subset of data/ but explicit for clarity)
+data/necis/api_calls.json
+data/necis/debug_*.png
+
+# AI assistant context — project-internal only
+CLAUDE.md
+.claude/
+
+# Superseded by docs/guide.md
+NECIS_DOWNLOAD_GUIDE.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
