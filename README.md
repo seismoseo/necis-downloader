@@ -18,8 +18,8 @@ SPA where users submit a download job, wait for the server to package the data,
 and then retrieve it from a history page. This tool automates that workflow:
 
 1. **Submit** a download request via Playwright browser automation
-2. **Poll** the history JSON API every 30 s until the zip is ready (~2–10 min)
-3. **Download** the zip via HTTP session (with session cookies)
+2. **Poll** the history JSON API until the zip is ready (~10–30 min for full day)
+3. **Download** the zip via HTTP (session cookies, with resume on connection drops)
 4. **Organize** miniSEED files into a `YYYY/STA/` directory tree
 
 Supports both **continuous** (daily archive) and **event-based** waveform downloads
@@ -52,7 +52,19 @@ cp .env.example .env
 
 ## Quick Start
 
-### Single day, specific stations
+### All stations, one day (default — same as daily cron)
+
+```bash
+python download_continuous.py \
+    --date 2026-01-15 \
+    --channels HHZ,HHN,HHE \
+    --continuous-dir /data/necis/continuous
+```
+
+Submits a single request for all 404 KS stations. The server packages one large
+zip (~10 GB); the download resumes automatically if the connection drops.
+
+### Specific stations
 
 ```bash
 python download_continuous.py \
@@ -62,24 +74,42 @@ python download_continuous.py \
     --continuous-dir /data/necis/continuous
 ```
 
-### All KS stations, date range (archive)
+### Date range (historical backfill)
 
 ```bash
-mkdir -p logs
-nohup ./archive_necis.sh 2026-01-01 2026-12-31 >> logs/archive_necis.log 2>&1 &
+nohup ./archive_necis.sh 2026-01-01 2026-01-31 \
+    >> logs/archive_necis.log 2>&1 &
 tail -f logs/archive_necis.log
 ```
 
-The script batches stations (2 per request) to stay under NECIS's 40 MB
-per-request cap and prints an estimated completion time before starting.
+`archive_necis.sh` splits the request into batches of 2 stations to keep each
+zip small and reliable. Use this for bulk backfill; use `download_continuous.py`
+directly for day-by-day downloads.
+
+### Resume a failed download (without re-requesting)
+
+If the download failed mid-transfer and the job is still shown as complete in
+the NECIS history, use `--fetch-only` to skip the request step and resume:
+
+```bash
+python download_continuous.py \
+    --fetch-only \
+    --poll-interval 60 \
+    --max-wait 7200 \
+    --organize \
+    --continuous-dir /data/necis/continuous
+```
 
 ### Daily cron job
 
 ```bash
 crontab -e
-# Add:
-30 4 * * * /path/to/necis-downloader/run_daily.sh >> /var/log/necis.log 2>&1
+# Add (runs at 01:00 KST every day):
+0 1 * * * /path/to/necis-downloader/run_daily.sh >> /var/log/necis.log 2>&1
 ```
+
+`run_daily.sh` downloads yesterday's data for all available NECIS stations
+using the single-request approach above.
 
 ---
 
@@ -89,11 +119,11 @@ crontab -e
 data/necis/continuous/
   2026/
     ADOA/
-      KS.ADOA.HGZ.2026.001.00.00.00   ← miniSEED, no file extension
-      KS.ADOA.HGN.2026.001.00.00.00
-      KS.ADOA.HGE.2026.001.00.00.00
+      KS.ADOA.HHZ.2026.015.00.00.00   ← miniSEED, no file extension
+      KS.ADOA.HHN.2026.015.00.00.00
+      KS.ADOA.HHE.2026.015.00.00.00
     AGSA/
-      KS.AGSA.HGZ.2026.001.00.00.00
+      KS.AGSA.HHZ.2026.015.00.00.00
       ...
 ```
 
@@ -112,14 +142,11 @@ Credentials are read from `.env` (copy `.env.example` → `.env`):
 | `NECIS_HEADLESS` | — | `1` | Set to `0` to watch the browser window |
 | `NECIS_DOWNLOAD_DIR` | — | `data/necis` | Intermediate zip/staging root |
 
-Shell environment variables for `archive_necis.sh`:
+Shell environment variables for `run_daily.sh` and `archive_necis.sh`:
 
 | Variable | Default | Description |
 |---|---|---|
 | `CONTINUOUS_DIR` | `data/necis/continuous` | Organized output root |
-| `BATCH_SIZE` | `2` | Stations per NECIS request |
-| `CHANNELS` | `HHZ,HHN,HHE` | Channel codes (→ E/N/Z components) |
-| `STATION_CSV` | auto-detected | Path to `KP_station_list.csv` |
 
 ---
 
@@ -139,10 +166,11 @@ channels are retrieved in a single pass.
 download_continuous.py
   └─ NECISBrowser (Playwright, headless Chromium)
        ├─ Login
-       └─ For each station batch per day:
+       └─ For each day:
             ├─ continuous.py: fill form, click "다운로드 요청" → job queued
-            ├─ fetch_downloads.py: poll requestFilesHisAjax.do (30 s interval)
-            │    └─ requests.Session (with Playwright cookies): stream GET zip
+            ├─ fetch_downloads.py: poll requestFilesHisAjax.do until status="C"
+            │    └─ requests.Session (with Playwright cookies):
+            │         stream-GET zip, resume via HTTP Range on connection drops
             └─ utils.py: extract zip → organize into YYYY/STA/
 ```
 
@@ -156,14 +184,15 @@ job, avoiding accidental re-downloads of old queued jobs.
 ```
 --date YYYY-MM-DD       Single day (overrides --start/--end)
 --start / --end         Date range (default: yesterday)
---stations STA1,STA2    Station codes (no network prefix)
---station-csv PATH      KP_station_list.csv (auto-detected if omitted)
+--stations STA1,STA2    Station codes; omit to request all NECIS stations
+--station-csv PATH      Load station list from CSV (must be set explicitly)
 --network KS            Filter station CSV to network (default: KS)
 --channels HHZ,HHN,HHE Channel codes (default: HHZ,HHN,HHE)
 --batch-size N          Max stations per request (default: all at once)
 --continuous-dir PATH   Organized output root
 --poll-interval SEC     Seconds between polls (default: 30)
 --max-wait SEC          Max wait for server (default: 600)
+--fetch-only            Skip request; download already-queued files
 --no-fetch              Submit only; skip polling/download
 --no-organize           Download only; skip zip extraction
 ```
@@ -204,14 +233,14 @@ necis-downloader/
 │   ├── config.py             NECISConfig — credentials and paths
 │   ├── browser.py            Playwright browser client (login, navigation)
 │   ├── continuous.py         Continuous waveform request submission
-│   ├── fetch_downloads.py    History API polling + HTTP download
+│   ├── fetch_downloads.py    History API polling + HTTP download (with resume)
 │   ├── utils.py              Zip extraction, miniSEED organization
 │   └── events.py             Event waveform pipeline
 ├── download_continuous.py    CLI: continuous waveforms
 ├── download_events.py        CLI: event waveforms
 ├── discover_necis.py         Browser inspection / API capture tool
-├── archive_necis.sh          Archive shell script (date range, all stations)
-├── run_daily.sh              Cron wrapper (downloads yesterday's data)
+├── archive_necis.sh          Batch archive script (date range, 2-station batches)
+├── run_daily.sh              Cron wrapper (all stations, yesterday's data, 01:00 KST)
 ├── 01.Test_pipeline.ipynb    Interactive test notebook
 ├── requirements_necis.txt    Python dependencies
 ├── pyproject.toml            Package metadata
@@ -224,9 +253,14 @@ necis-downloader/
 
 ## Limitations
 
-- **40 MB per-request cap** enforced by NECIS. At 100 Hz, 3 components ≈ 42 MB/station/day, so `--batch-size 2` is the practical maximum for full-component downloads.
-- **Archive time:** 404 KS stations at batch-size 2 → ~203 requests/day × ~4 min = ~13 h per calendar day of data. A full year takes roughly 50 days of wall time.
-- **Event selectors** in `necis/events.py` have `# ADAPT` placeholders that must be filled in after a live `discover_necis.py` run.
+- **Daily quota:** NECIS enforces ~10 GB/day (and ~30 GB over any 3-day window).
+  One full day of all 404 KS stations ≈ 9.5–10.7 GB, consuming the entire daily
+  allowance. Plan archive work accordingly (~1 calendar day per real day).
+- **Server throughput:** The NECIS FTP server delivers at ~0.5 MB/s and
+  frequently drops connections mid-transfer. The downloader resumes via HTTP
+  Range requests; expect 6–12 hours to download a full day of all-station data.
+- **Event selectors** in `necis/events.py` have `# ADAPT` placeholders that
+  must be filled in after a live `discover_necis.py` run.
 - Requires an active NECIS account (KMA employee or registered researcher).
 
 ---
