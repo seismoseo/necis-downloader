@@ -5,7 +5,7 @@
 # No station CSV needed — stations are scraped from the NECIS DOM at runtime.
 #
 # Cron entry (1 AM KST every day):
-#   0 1 * * * /home/msseo/works/Claude/run_daily.sh >> /var/log/necis.log 2>&1
+#   0 1 * * * /home/msseo/works/Claude/run_daily.sh >> /home/msseo/works/Claude/logs/necis.log 2>&1
 #
 # Env overrides (set in .env or shell):
 #   CONTINUOUS_DIR   organized output root (default: data/necis/continuous)
