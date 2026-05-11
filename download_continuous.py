@@ -88,6 +88,8 @@ def _parse_args():
 
     p.add_argument("--fetch",         action=argparse.BooleanOptionalAction, default=True,
                    help="Wait and fetch prepared zip files after request (default: on)")
+    p.add_argument("--fetch-only",    action="store_true",
+                   help="Skip the request step; poll history and download already-queued files")
     p.add_argument("--poll-interval", type=int, default=30, metavar="SEC")
     p.add_argument("--max-wait",      type=int, default=600, metavar="SEC")
     p.add_argument("--organize",      action=argparse.BooleanOptionalAction, default=True,
@@ -175,6 +177,24 @@ def main():
 
     zip_dir   = cfg.download_dir / "zips"
     cont_root = Path(args.continuous_dir or "/home/msseo/works/Claude/data/necis/continuous")
+
+    if args.fetch_only:
+        # Skip request; download whatever is already prepared in the history
+        async def _fetch_only():
+            async with NECISBrowser(cfg) as browser:
+                files = await fetch_ready_downloads(
+                    browser,
+                    out_dir=zip_dir,
+                    poll_interval=args.poll_interval,
+                    max_wait=args.max_wait,
+                )
+                if args.organize and files:
+                    organized = process_continuous_downloads(
+                        zip_dir, cont_root, move=True, delete_zip=True)
+                    logger.info("Organized %d file(s) → %s", len(organized), cont_root)
+                return files
+        asyncio.run(_fetch_only())
+        return
 
     if stations is None:
         # Single request for all stations currently on the NECIS page
