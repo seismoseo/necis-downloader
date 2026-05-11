@@ -1,10 +1,20 @@
 #!/bin/bash
-# run_daily.sh  — Daily NECIS continuous waveform download (cron wrapper).
+# run_daily.sh — Daily NECIS continuous waveform download (cron wrapper).
 #
-# Add to crontab (runs at 04:30 KST every morning):
-#   30 4 * * * /home/msseo/works/Claude/run_daily.sh >> /var/log/necis.log 2>&1
+# Downloads all stations currently available on the NECIS page for yesterday.
+# No station CSV needed — stations are scraped from the NECIS DOM at runtime.
 #
-# Requires: .env with NECIS_USER and NECIS_PASS in the same directory.
+# Cron entry (1 AM KST every day):
+#   0 1 * * * /home/msseo/works/Claude/run_daily.sh >> /var/log/necis.log 2>&1
+#
+# Env overrides (set in .env or shell):
+#   CONTINUOUS_DIR   organized output root (default: data/necis/continuous)
+#   NECIS_USER / NECIS_PASS
+#
+# Notes:
+#   - NECIS allows ~10 GB/day. One full day of all KS stations ≈ 9.5 GB.
+#   - --max-wait 7200 (2 h): the server takes ~10–30 min to prepare a full-day zip.
+#   - --poll-interval 60: reduces polling noise for a single long-running job.
 
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -12,6 +22,19 @@ cd "$(dirname "$0")"
 source .env 2>/dev/null || true
 
 DATE=$(date -d "yesterday" +%Y-%m-%d)
+CONTINUOUS_DIR="${CONTINUOUS_DIR:-/home/msseo/works/Claude/data/necis/continuous}"
+
+mkdir -p logs
+
 echo "=== $(date '+%Y-%m-%d %H:%M:%S') Daily NECIS download for $DATE ==="
-bash "$(dirname "$0")/archive_necis.sh" "$DATE" "$DATE"
+
+python download_continuous.py \
+    --date           "$DATE" \
+    --channels       HHZ,HHN,HHE \
+    --fetch \
+    --poll-interval  60 \
+    --max-wait       7200 \
+    --organize \
+    --continuous-dir "$CONTINUOUS_DIR"
+
 echo "=== $(date '+%Y-%m-%d %H:%M:%S') Done ==="

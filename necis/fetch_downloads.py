@@ -142,15 +142,21 @@ def _filename_from_response(resp: requests.Response, url: str) -> str:
     return url.rstrip("/").split("/")[-1] or "download.zip"
 
 
-def _download_file(session: requests.Session, url: str, out_dir: Path) -> Optional[Path]:
+def _download_file(session: requests.Session, url: str, out_dir: Path,
+                   download_timeout: int = 600) -> Optional[Path]:
     """Stream-GET a single URL and save to out_dir.
 
     Writes to a .part temp file and renames on completion to avoid
     partial files being picked up by concurrent or retry runs.
+
+    download_timeout bounds total wall-clock download time (default 600 s).
+    This is needed because requests timeout= only guards the initial
+    connection/headers; a stalled streaming body never fires that timeout.
     """
     logger.info("Downloading %s …", url)
+    tmp: Optional[Path] = None
     try:
-        with session.get(url, stream=True, timeout=300) as resp:
+        with session.get(url, stream=True, timeout=60) as resp:
             resp.raise_for_status()
             fname = _filename_from_response(resp, url)
             dest = out_dir / fname
@@ -162,12 +168,17 @@ def _download_file(session: requests.Session, url: str, out_dir: Path) -> Option
                 logger.info("  File size: %.1f MB", total / 1e6)
             tmp = dest.with_suffix(dest.suffix + ".part")
             downloaded = 0
+            deadline = time.time() + download_timeout
             with tmp.open("wb") as f:
                 for chunk in resp.iter_content(chunk_size=1 << 20):  # 1 MB chunks
+                    if time.time() > deadline:
+                        raise TimeoutError(
+                            f"Download stalled — no progress after {download_timeout}s")
                     if chunk:
-                        f.write(chunk)
                         downloaded += len(chunk)
-                        if total and downloaded % (50 << 20) < (1 << 20):
+                        f.write(chunk)
+                        deadline = time.time() + download_timeout  # reset on progress
+                        if total and downloaded % (10 << 20) < (1 << 20):
                             logger.info("  %.0f / %.0f MB (%.0f%%)",
                                         downloaded / 1e6, total / 1e6,
                                         100 * downloaded / total)
@@ -176,6 +187,8 @@ def _download_file(session: requests.Session, url: str, out_dir: Path) -> Option
             return dest
     except Exception as e:
         logger.error("Failed to download %s: %s", url, e)
+        if tmp and tmp.exists():
+            tmp.unlink(missing_ok=True)
         return None
 
 
@@ -186,6 +199,7 @@ async def fetch_ready_downloads(
     max_wait: int = 600,
     file_gbn: Optional[str] = None,
     submitted_after: Optional[datetime] = None,
+    download_timeout: int = 600,
 ) -> list[Path]:
     """Poll history API and download all completed files.
 
@@ -231,7 +245,8 @@ async def fetch_ready_downloads(
         if dl_path.startswith("/data/ftp/"):
             dl_path = dl_path[len("/data/ftp"):]
         full_url = ftp_url + dl_path
-        path = _download_file(session, full_url, out_dir)
+        path = _download_file(session, full_url, out_dir,
+                              download_timeout=download_timeout)
         if path:
             saved.append(path)
 

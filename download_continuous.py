@@ -74,7 +74,7 @@ def _parse_args():
     p.add_argument("--end",         metavar="YYYY-MM-DD")
     p.add_argument("--stations",    metavar="STA1,STA2,...")
     p.add_argument("--station-csv", metavar="PATH",
-                   default=_find_station_csv())
+                   default="")
     p.add_argument("--channels",    default="HHZ,HHN,HHE")
     p.add_argument("--output-dir",  metavar="PATH")
     p.add_argument("--capture-api", action="store_true")
@@ -145,7 +145,8 @@ def main():
         logger.info("Loaded %d stations from %s (network=%s)",
                     len(stations), args.station_csv, args.network or "all")
     else:
-        sys.exit("Provide --stations or a valid --station-csv")
+        stations = None  # all stations currently on the NECIS page (scraped from DOM)
+        logger.info("No station list provided — all available NECIS stations will be requested")
 
     channels = [c.strip() for c in args.channels.split(",") if c.strip()]
     # NECIS component checkboxes use single-letter codes (last char of channel name)
@@ -156,10 +157,9 @@ def main():
         overrides["download_dir"] = Path(args.output_dir)
     cfg = NECISConfig.from_env(**overrides)
 
-    logger.info(
-        "Continuous download | %s → %s | %d station(s) | channels: %s",
-        start, end, len(stations), channels,
-    )
+    sta_desc = f"{len(stations)} station(s)" if stations is not None else "all NECIS stations"
+    logger.info("Continuous download | %s → %s | %s | channels: %s",
+                start, end, sta_desc, channels)
 
     if not args.fetch:
         # Submit-only mode: queue all days then exit (user fetches manually later)
@@ -176,23 +176,31 @@ def main():
     zip_dir   = cfg.download_dir / "zips"
     cont_root = Path(args.continuous_dir or "/home/msseo/works/Claude/data/necis/continuous")
 
-    batch_size    = args.batch_size or len(stations)
-    batches       = [stations[i:i+batch_size]
-                     for i in range(0, len(stations), batch_size)]
-    total_batches = len(batches)
+    if stations is None:
+        # Single request for all stations currently on the NECIS page
+        batches       = [None]
+        total_batches = 1
+    else:
+        batch_size    = args.batch_size or len(stations)
+        batches       = [stations[i:i+batch_size]
+                         for i in range(0, len(stations), batch_size)]
+        total_batches = len(batches)
 
     day = start
     while day <= end:
         logger.info("=" * 60)
-        logger.info("Processing %s  (%d batch(es), up to %d stations each)",
-                    day, total_batches, batch_size)
+        if total_batches == 1 and batches[0] is None:
+            logger.info("Processing %s  (1 request, all NECIS stations)", day)
+        else:
+            logger.info("Processing %s  (%d batch(es))", day, total_batches)
 
         async def run_one_day(day=day):
             total_organized = 0
             async with NECISBrowser(cfg) as browser:   # one login per day
                 for b_idx, sta_batch in enumerate(batches, 1):
+                    batch_label = ",".join(sta_batch) if sta_batch is not None else "ALL stations"
                     logger.info("[%s] batch %d/%d: %s",
-                                day, b_idx, total_batches, ",".join(sta_batch))
+                                day, b_idx, total_batches, batch_label)
                     submitted_after = datetime.now()
                     ok = await request_day(browser, day, sta_batch, components)
                     if not ok:
