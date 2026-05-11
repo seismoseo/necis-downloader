@@ -143,53 +143,93 @@ def _filename_from_response(resp: requests.Response, url: str) -> str:
 
 
 def _download_file(session: requests.Session, url: str, out_dir: Path,
-                   download_timeout: int = 600) -> Optional[Path]:
-    """Stream-GET a single URL and save to out_dir.
+                   download_timeout: int = 600,
+                   max_retries: int = 10) -> Optional[Path]:
+    """Stream-GET a single URL and save to out_dir, resuming on connection drops.
 
-    Writes to a .part temp file and renames on completion to avoid
-    partial files being picked up by concurrent or retry runs.
-
-    download_timeout bounds total wall-clock download time (default 600 s).
-    This is needed because requests timeout= only guards the initial
-    connection/headers; a stalled streaming body never fires that timeout.
+    Uses HTTP Range requests so each retry continues from the byte offset
+    already written to the .part file rather than restarting from zero.
+    download_timeout resets on each received chunk; raises if no data arrives
+    for that many seconds (guards against TCP-keepalive stalls).
     """
-    logger.info("Downloading %s …", url)
-    tmp: Optional[Path] = None
-    try:
-        with session.get(url, stream=True, timeout=60) as resp:
-            resp.raise_for_status()
-            fname = _filename_from_response(resp, url)
-            dest = out_dir / fname
-            if dest.exists():
-                logger.info("Already exists, skipping: %s", dest)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tmp:  Optional[Path] = None
+    dest: Optional[Path] = None
+
+    for attempt in range(1, max_retries + 1):
+        offset = tmp.stat().st_size if (tmp is not None and tmp.exists()) else 0
+        req_headers = {"Range": f"bytes={offset}-"} if offset > 0 else {}
+        if attempt > 1:
+            logger.info("[attempt %d/%d] %s (offset %.1f MB)",
+                        attempt, max_retries, url, offset / 1e6)
+        else:
+            logger.info("Downloading %s …", url)
+        try:
+            with session.get(url, stream=True, timeout=60, headers=req_headers) as resp:
+                # 416 = our offset is past EOF — .part is corrupt; restart
+                if resp.status_code == 416:
+                    logger.warning("Range not satisfiable — restarting from zero")
+                    if tmp is not None:
+                        tmp.unlink(missing_ok=True)
+                    offset = 0
+                    continue
+                resp.raise_for_status()
+
+                if dest is None:
+                    fname = _filename_from_response(resp, url)
+                    dest = out_dir / fname
+                    if dest.exists():
+                        logger.info("Already exists, skipping: %s", dest)
+                        return dest
+                    tmp = dest.with_suffix(dest.suffix + ".part")
+                    offset = tmp.stat().st_size if tmp.exists() else 0
+
+                is_resume = resp.status_code == 206
+                if offset and not is_resume:
+                    logger.info("Server does not support Range; restarting")
+                    if tmp is not None:
+                        tmp.unlink(missing_ok=True)
+                    offset = 0
+
+                cl    = int(resp.headers.get("Content-Length", 0))
+                total = (offset + cl) if is_resume else cl
+                if attempt == 1 and total:
+                    logger.info("  File size: %.1f MB", total / 1e6)
+                elif attempt > 1 and total:
+                    logger.info("  Resuming %.1f / %.1f MB", offset / 1e6, total / 1e6)
+
+                downloaded = offset
+                deadline   = time.time() + download_timeout
+                mode = "ab" if (is_resume and offset > 0) else "wb"
+                with tmp.open(mode) as f:
+                    for chunk in resp.iter_content(chunk_size=1 << 20):
+                        if time.time() > deadline:
+                            raise TimeoutError(
+                                f"No progress for {download_timeout}s")
+                        if chunk:
+                            downloaded += len(chunk)
+                            f.write(chunk)
+                            deadline = time.time() + download_timeout
+                            if total and downloaded % (10 << 20) < (1 << 20):
+                                logger.info("  %.0f / %.0f MB (%.0f%%)",
+                                            downloaded / 1e6, total / 1e6,
+                                            100 * downloaded / total)
+                tmp.rename(dest)
+                logger.info("Saved → %s  (%.1f MB)", dest, dest.stat().st_size / 1e6)
                 return dest
-            total = int(resp.headers.get("Content-Length", 0))
-            if total:
-                logger.info("  File size: %.1f MB", total / 1e6)
-            tmp = dest.with_suffix(dest.suffix + ".part")
-            downloaded = 0
-            deadline = time.time() + download_timeout
-            with tmp.open("wb") as f:
-                for chunk in resp.iter_content(chunk_size=1 << 20):  # 1 MB chunks
-                    if time.time() > deadline:
-                        raise TimeoutError(
-                            f"Download stalled — no progress after {download_timeout}s")
-                    if chunk:
-                        downloaded += len(chunk)
-                        f.write(chunk)
-                        deadline = time.time() + download_timeout  # reset on progress
-                        if total and downloaded % (10 << 20) < (1 << 20):
-                            logger.info("  %.0f / %.0f MB (%.0f%%)",
-                                        downloaded / 1e6, total / 1e6,
-                                        100 * downloaded / total)
-            tmp.rename(dest)
-            logger.info("Saved → %s  (%.1f MB)", dest, dest.stat().st_size / 1e6)
-            return dest
-    except Exception as e:
-        logger.error("Failed to download %s: %s", url, e)
-        if tmp and tmp.exists():
-            tmp.unlink(missing_ok=True)
-        return None
+
+        except Exception as e:
+            logger.warning("[attempt %d/%d] %s", attempt, max_retries, e)
+            if attempt >= max_retries:
+                logger.error("Failed after %d attempts: %s", max_retries, url)
+                if tmp is not None and tmp.exists():
+                    tmp.unlink(missing_ok=True)
+                return None
+            wait = min(30 * attempt, 120)
+            logger.info("Retrying in %ds …", wait)
+            time.sleep(wait)
+
+    return None
 
 
 async def fetch_ready_downloads(
