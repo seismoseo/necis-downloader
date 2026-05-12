@@ -1,11 +1,15 @@
 #!/bin/bash
 # run_daily.sh — Daily NECIS continuous waveform download (cron wrapper).
 #
-# Downloads all stations currently available on the NECIS page for yesterday.
+# Downloads all stations currently available on the NECIS page for 2 days ago.
 # No station CSV needed — stations are scraped from the NECIS DOM at runtime.
 #
-# Cron entry (11 AM KST every day — 2 h after UTC midnight so yesterday's UTC data is complete):
-#   0 11 * * * /home/msseo/works/Claude/run_daily.sh >> /home/msseo/works/Claude/logs/necis.log 2>&1
+# Targeting 2 days ago instead of yesterday ensures the requested UTC date is
+# fully complete at 1 AM KST (= 16:00 UTC of the previous day, well past UTC
+# midnight for the day-before-yesterday).
+#
+# Cron entry (1 AM KST every day):
+#   0 1 * * * /home/msseo/works/Claude/run_daily.sh >> /home/msseo/works/Claude/logs/necis.log 2>&1
 #
 # Env overrides (set in .env or shell):
 #   CONTINUOUS_DIR   organized output root (default: data/necis/continuous)
@@ -21,7 +25,7 @@ cd "$(dirname "$0")"
 # shellcheck disable=SC1091
 source .env 2>/dev/null || true
 
-DATE=$(date -d "yesterday" +%Y-%m-%d)
+DATE=$(date -d "2 days ago" +%Y-%m-%d)
 CONTINUOUS_DIR="${CONTINUOUS_DIR:-/home/msseo/works/Claude/data/necis/continuous}"
 
 mkdir -p logs
