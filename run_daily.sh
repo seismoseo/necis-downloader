@@ -28,7 +28,7 @@ mkdir -p logs
 
 echo "=== $(date '+%Y-%m-%d %H:%M:%S') Daily NECIS download for $DATE ==="
 
-python download_continuous.py \
+/home/msseo/miniforge3/envs/pipeline/bin/python download_continuous.py \
     --date           "$DATE" \
     --channels       HHZ,HHN,HHE \
     --fetch \
