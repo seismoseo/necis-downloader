@@ -246,22 +246,42 @@ def _download_file(session: requests.Session, url: str, out_dir: Path,
     return None
 
 
+def _extract_req_id(record: dict) -> Optional[str]:
+    """Try to extract the numeric request ID from a history API record.
+
+    The FTP filename pattern is {reqId}_{userSuffix}_part.zip, where reqId is
+    a server-assigned integer (e.g. 419570).  The field name in the API response
+    is unknown until we see the raw record; try the most likely names.
+    """
+    for field in ("reqNo", "reqFileId", "fileId", "requestNo", "reqId",
+                  "downLoadReqId", "downReqNo", "reqFileNo"):
+        val = record.get(field)
+        if val is not None and str(val).strip().isdigit():
+            logger.debug("Found req_id=%s via field '%s'", val, field)
+            return str(val).strip()
+    return None
+
+
 def _find_split_parts_on_ftp(
     session: requests.Session,
     ftp_base: str,
+    req_id: Optional[str] = None,
     submitted_after: Optional[datetime] = None,
 ) -> list[tuple[str, str]]:
     """Browse the FTP HTTP directory listing to find split archive part pairs.
 
     NECIS split archives are named {reqId}_{suffix}_part.z01 (data) and
     {reqId}_{suffix}_part.zip (central directory).  Both must be downloaded
-    before unzip can reassemble them.
+    before unzip can reassemble them.  The FTP server is shared by all NECIS
+    users, so we filter by req_id (preferred) or submitted_after timestamp.
 
     Parameters
     ----------
     session         : authenticated requests.Session (with NECIS cookies)
     ftp_base        : FTP HTTP base URL, e.g. "http://ftp.necis.kma.go.kr:8080"
-    submitted_after : if given, skip pairs whose listing timestamp predates this
+    req_id          : numeric request ID (e.g. "419570") — used as filename prefix
+                      to select only our file pair among all users' archives
+    submitted_after : fallback filter: skip pairs whose listing timestamp < this
 
     Returns
     -------
@@ -277,44 +297,62 @@ def _find_split_parts_on_ftp(
 
     html = resp.text
 
-    # Collect all *_part.zip filenames from href attributes
-    zip_names = re.findall(r'href="([^"/?][^"]*_part\.zip)"', html)
-    if not zip_names:
-        logger.warning("No *_part.zip entries found in FTP listing at %s", listing_url)
-        return []
+    if req_id:
+        # Precise filter: match only files belonging to this request.
+        # Pattern: {reqId}_{anything}_part.zip
+        pattern = rf'href="({re.escape(req_id)}_[^"]*_part\.zip)"'
+        zip_names = re.findall(pattern, html)
+        if not zip_names:
+            logger.warning(
+                "No file matching req_id=%s found in FTP listing at %s",
+                req_id, listing_url,
+            )
+            return []
+        logger.info("req_id=%s → matched %d file(s) in FTP listing", req_id, len(zip_names))
+    else:
+        # req_id unknown — fall back to timestamp filtering with a clear warning.
+        logger.warning(
+            "Request ID not found in history record — filtering FTP listing by "
+            "submitted_after timestamp only. This may pick up other users' files "
+            "if they submitted at the same time. Check log for 'Split archive record "
+            "fields' to identify the correct req_id field name."
+        )
+        zip_names = re.findall(r'href="([^"/?][^"]*_part\.zip)"', html)
+        if not zip_names:
+            logger.warning("No *_part.zip entries found in FTP listing at %s", listing_url)
+            return []
 
-    # Try to parse per-file modification timestamps for cutoff filtering.
-    # Apache/nginx listings use formats like "12-May-2026 16:30" or "2026-05-12 16:30".
-    # We match the timestamp immediately following each *_part.zip href.
-    file_times: dict[str, datetime] = {}
-    for m in re.finditer(
-        r'href="([^"]*_part\.zip)"[^>]*>[^\n]*\n[^\n]*'
-        r'(\d{2}-\w{3}-\d{4}\s+\d{2}:\d{2}|\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})',
-        html,
-    ):
-        fname, ts_str = m.group(1), m.group(2).strip()
-        for fmt in ("%d-%b-%Y %H:%M", "%Y-%m-%d %H:%M"):
-            try:
-                file_times[fname] = datetime.strptime(ts_str, fmt)
-                break
-            except ValueError:
-                pass
+        # Parse modification timestamps for timestamp-based filtering
+        file_times: dict[str, datetime] = {}
+        for m in re.finditer(
+            r'href="([^"]*_part\.zip)"[^>]*>[^\n]*\n[^\n]*'
+            r'(\d{2}-\w{3}-\d{4}\s+\d{2}:\d{2}|\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})',
+            html,
+        ):
+            fname, ts_str = m.group(1), m.group(2).strip()
+            for fmt in ("%d-%b-%Y %H:%M", "%Y-%m-%d %H:%M"):
+                try:
+                    file_times[fname] = datetime.strptime(ts_str, fmt)
+                    break
+                except ValueError:
+                    pass
+
+        if submitted_after:
+            zip_names = [
+                z for z in zip_names
+                if z not in file_times or file_times[z] >= submitted_after
+            ]
 
     base = ftp_base.rstrip("/") + "/mseed/"
-    pairs: list[tuple[str, str]] = []
-    for zip_name in zip_names:
-        if submitted_after and zip_name in file_times:
-            if file_times[zip_name] < submitted_after:
-                logger.debug("Skipping %s (older than cutoff)", zip_name)
-                continue
-        z01_name = re.sub(r'\.zip$', '.z01', zip_name)
-        pairs.append((base + z01_name, base + zip_name))
-
+    pairs = [
+        (base + re.sub(r'\.zip$', '.z01', z), base + z)
+        for z in zip_names
+    ]
     if pairs:
         logger.info("Found %d split archive pair(s) in FTP listing", len(pairs))
     else:
-        logger.warning("No split archive pairs after cutoff filtering (cutoff: %s)",
-                       submitted_after)
+        logger.warning("No split archive pairs matched (req_id=%s, cutoff=%s)",
+                       req_id, submitted_after)
     return pairs
 
 
@@ -389,16 +427,19 @@ async def fetch_ready_downloads(
             "%d split archive record(s) detected — browsing FTP directory for parts",
             len(split_records),
         )
-        # Log all fields of the first split record so we can identify the
-        # request-ID field and use it for precise filtering in a future update.
+        # Log all fields so we can confirm (or discover) the req_id field name.
         logger.info("Split archive record fields: %s", split_records[0])
 
-        # All split records share the same ftpUrl; collect unique bases
-        ftp_bases = {(r.get("ftpUrl") or "").rstrip("/") for r in split_records}
-        for ftp_base in ftp_bases:
+        for record in split_records:
+            ftp_base = (record.get("ftpUrl") or "").rstrip("/")
             if not ftp_base:
                 continue
-            pairs = _find_split_parts_on_ftp(session, ftp_base, submitted_after)
+            req_id = _extract_req_id(record)
+            if req_id:
+                logger.info("Using req_id=%s to filter FTP listing", req_id)
+            pairs = _find_split_parts_on_ftp(
+                session, ftp_base, req_id=req_id, submitted_after=submitted_after
+            )
             for z01_url, zip_url in pairs:
                 z01_path = _download_file(session, z01_url, out_dir,
                                           download_timeout=download_timeout)
