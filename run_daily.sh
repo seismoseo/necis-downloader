@@ -1,13 +1,12 @@
 #!/bin/bash
 # run_daily.sh — Daily NECIS continuous waveform download (cron wrapper).
 #
-# Downloads all KS stations in batches of 20 for 2 days ago.
+# Downloads all KS stations in a single request for 2 days ago.
 #
-# Batch approach (--batch-size 20, ~21 batches of ~600 MB each) is used because
-# NECIS now creates split ZIP archives (.z01 + .zip) for large all-stations
-# requests (~10 GB), and the history API leaves downloadPath empty for split
-# archives. Batching keeps each ZIP under the single-file threshold so the
-# download URL is always populated.
+# Single-request approach: NECIS packages all ~404 stations into a split ZIP
+# archive (.z01 + .zip) for large requests (~10 GB).  fetch_downloads.py detects
+# the empty downloadPath, browses the FTP HTTP directory to find both parts,
+# downloads them, and extracts with unzip (which handles split ZIPs natively).
 #
 # Targeting 2 days ago ensures the requested UTC date is fully complete at 1 AM
 # KST (= 16:00 UTC previous day, well past UTC midnight for day-before-yesterday).
@@ -34,11 +33,9 @@ echo "=== $(date '+%Y-%m-%d %H:%M:%S') Daily NECIS download for $DATE ==="
 /home/msseo/miniforge3/envs/pipeline/bin/python download_continuous.py \
     --date           "$DATE" \
     --channels       HHZ,HHN,HHE \
-    --station-csv    /home/msseo/works/SGTL-SKP-workspace/meta/KP_station_list.csv \
-    --batch-size     20 \
     --fetch \
-    --poll-interval  30 \
-    --max-wait       600 \
+    --poll-interval  60 \
+    --max-wait       7200 \
     --organize \
     --continuous-dir "$CONTINUOUS_DIR"
 

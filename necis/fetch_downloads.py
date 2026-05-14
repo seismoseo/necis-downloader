@@ -16,6 +16,11 @@ History JSON API:
     status "C" = complete (다운로드가능)
     status "P" = processing (처리중)
     full URL = ftpUrl + downloadPath
+
+Split archives: when NECIS packages more than ~40 MB (e.g. all-stations ~10 GB),
+it produces a split ZIP: {name}_part.z01 (data) + {name}_part.zip (central dir).
+The history API leaves downloadPath empty for these.  We detect them by browsing
+the FTP HTTP directory listing and download both parts; unzip handles reassembly.
 """
 
 from __future__ import annotations
@@ -78,8 +83,11 @@ async def _poll_for_ready(
     """Navigate to history page then poll the JSON API until files are ready.
 
     Returns a list of records with status == "C" (and reqDt >= submitted_after
-    if provided).  Requires at least 2 polls before declaring "nothing to wait
-    for" so the server has time to register the newly submitted job.
+    if provided).  Includes split-archive records (empty downloadPath) so the
+    caller can handle them separately.
+
+    Requires at least 2 polls before declaring "nothing to wait for" so the
+    server has time to register the newly submitted job.
     """
     await browser.page.goto(
         browser.cfg.base_url + HISTORY_URL,
@@ -105,13 +113,15 @@ async def _poll_for_ready(
         if cutoff:
             records = [r for r in records if (r.get("reqDt") or "") >= cutoff]
 
-        ready      = [r for r in records if r.get("status") == STATUS_COMPLETE
-                      and r.get("downloadPath")]
+        # All "C" records are ready — including split archives with empty downloadPath
+        ready      = [r for r in records if r.get("status") == STATUS_COMPLETE]
         processing = [r for r in records if r.get("status") == STATUS_PROCESSING]
 
+        n_normal = sum(1 for r in ready if r.get("downloadPath"))
+        n_split  = len(ready) - n_normal
         logger.info(
-            "[poll #%d] ready=%d  processing=%d  (cutoff: %s)",
-            attempt, len(ready), len(processing), cutoff or "none",
+            "[poll #%d] ready=%d (normal=%d split=%d)  processing=%d  (cutoff: %s)",
+            attempt, len(ready), n_normal, n_split, len(processing), cutoff or "none",
         )
 
         if ready:
@@ -236,6 +246,78 @@ def _download_file(session: requests.Session, url: str, out_dir: Path,
     return None
 
 
+def _find_split_parts_on_ftp(
+    session: requests.Session,
+    ftp_base: str,
+    submitted_after: Optional[datetime] = None,
+) -> list[tuple[str, str]]:
+    """Browse the FTP HTTP directory listing to find split archive part pairs.
+
+    NECIS split archives are named {reqId}_{suffix}_part.z01 (data) and
+    {reqId}_{suffix}_part.zip (central directory).  Both must be downloaded
+    before unzip can reassemble them.
+
+    Parameters
+    ----------
+    session         : authenticated requests.Session (with NECIS cookies)
+    ftp_base        : FTP HTTP base URL, e.g. "http://ftp.necis.kma.go.kr:8080"
+    submitted_after : if given, skip pairs whose listing timestamp predates this
+
+    Returns
+    -------
+    List of (z01_url, zip_url) tuples — one per split archive pair found.
+    """
+    listing_url = ftp_base.rstrip("/") + "/mseed/"
+    try:
+        resp = session.get(listing_url, timeout=30)
+        resp.raise_for_status()
+    except Exception as e:
+        logger.warning("Cannot browse FTP directory %s: %s", listing_url, e)
+        return []
+
+    html = resp.text
+
+    # Collect all *_part.zip filenames from href attributes
+    zip_names = re.findall(r'href="([^"/?][^"]*_part\.zip)"', html)
+    if not zip_names:
+        logger.warning("No *_part.zip entries found in FTP listing at %s", listing_url)
+        return []
+
+    # Try to parse per-file modification timestamps for cutoff filtering.
+    # Apache/nginx listings use formats like "12-May-2026 16:30" or "2026-05-12 16:30".
+    # We match the timestamp immediately following each *_part.zip href.
+    file_times: dict[str, datetime] = {}
+    for m in re.finditer(
+        r'href="([^"]*_part\.zip)"[^>]*>[^\n]*\n[^\n]*'
+        r'(\d{2}-\w{3}-\d{4}\s+\d{2}:\d{2}|\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})',
+        html,
+    ):
+        fname, ts_str = m.group(1), m.group(2).strip()
+        for fmt in ("%d-%b-%Y %H:%M", "%Y-%m-%d %H:%M"):
+            try:
+                file_times[fname] = datetime.strptime(ts_str, fmt)
+                break
+            except ValueError:
+                pass
+
+    base = ftp_base.rstrip("/") + "/mseed/"
+    pairs: list[tuple[str, str]] = []
+    for zip_name in zip_names:
+        if submitted_after and zip_name in file_times:
+            if file_times[zip_name] < submitted_after:
+                logger.debug("Skipping %s (older than cutoff)", zip_name)
+                continue
+        z01_name = re.sub(r'\.zip$', '.z01', zip_name)
+        pairs.append((base + z01_name, base + zip_name))
+
+    if pairs:
+        logger.info("Found %d split archive pair(s) in FTP listing", len(pairs))
+    else:
+        logger.warning("No split archive pairs after cutoff filtering (cutoff: %s)",
+                       submitted_after)
+    return pairs
+
+
 async def fetch_ready_downloads(
     browser: NECISBrowser,
     out_dir: Optional[Path] = None,
@@ -246,6 +328,9 @@ async def fetch_ready_downloads(
     download_timeout: int = 600,
 ) -> list[Path]:
     """Poll history API and download all completed files.
+
+    Handles both normal single-file ZIPs (downloadPath populated) and split
+    archives (downloadPath empty) by browsing the FTP HTTP directory.
 
     Parameters
     ----------
@@ -260,7 +345,7 @@ async def fetch_ready_downloads(
 
     Returns
     -------
-    List of Path objects for successfully saved files.
+    List of Path objects for successfully saved files (both .zip and .z01 parts).
     """
     out_dir = out_dir or (browser.cfg.download_dir / "zips")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -278,7 +363,10 @@ async def fetch_ready_downloads(
 
     session = await _copy_cookies_to_session(browser)
     saved = []
-    for record in ready_records:
+
+    # --- Normal records: downloadPath is populated ---
+    normal_records = [r for r in ready_records if r.get("downloadPath")]
+    for record in normal_records:
         ftp_url  = (record.get("ftpUrl") or "").rstrip("/")
         dl_path  = record.get("downloadPath") or ""
         if not ftp_url or not dl_path:
@@ -293,6 +381,29 @@ async def fetch_ready_downloads(
                               download_timeout=download_timeout)
         if path:
             saved.append(path)
+
+    # --- Split archive records: downloadPath is empty ---
+    split_records = [r for r in ready_records if not r.get("downloadPath")]
+    if split_records:
+        logger.info(
+            "%d split archive record(s) detected — browsing FTP directory for parts",
+            len(split_records),
+        )
+        # All split records share the same ftpUrl; collect unique bases
+        ftp_bases = {(r.get("ftpUrl") or "").rstrip("/") for r in split_records}
+        for ftp_base in ftp_bases:
+            if not ftp_base:
+                continue
+            pairs = _find_split_parts_on_ftp(session, ftp_base, submitted_after)
+            for z01_url, zip_url in pairs:
+                z01_path = _download_file(session, z01_url, out_dir,
+                                          download_timeout=download_timeout)
+                zip_path = _download_file(session, zip_url, out_dir,
+                                          download_timeout=download_timeout)
+                if z01_path:
+                    saved.append(z01_path)
+                if zip_path:
+                    saved.append(zip_path)
 
     logger.info("Total files saved: %d", len(saved))
     return saved

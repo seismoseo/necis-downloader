@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import re
 import shutil
+import subprocess
 import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -71,28 +72,57 @@ def extract_zips(
         return []
 
     for zp in zip_files:
-        logger.info("Extracting %s …", zp.name)
-        try:
-            with zipfile.ZipFile(zp) as zf:
-                for member in zf.namelist():
-                    fname = Path(member).name
-                    if not fname:
-                        continue  # skip directory entries
-                    dest = out_dir / fname
-                    if dest.exists():
-                        logger.debug("  skip (exists): %s", fname)
+        z01 = zp.with_suffix(".z01")
+        if z01.exists():
+            # Split archive — both parts present; unzip handles reassembly automatically
+            # when .z01 is in the same directory as .zip.
+            logger.info("Extracting split archive %s + %s …", z01.name, zp.name)
+            try:
+                result = subprocess.run(
+                    ["unzip", "-o", str(zp), "-d", str(out_dir)],
+                    capture_output=True, text=True, cwd=str(zp.parent),
+                )
+                if result.returncode != 0:
+                    logger.error("unzip failed for %s: %s", zp.name,
+                                 (result.stderr or result.stdout)[-500:])
+                    continue
+                for line in result.stdout.splitlines():
+                    m = re.match(r'\s+(?:inflating|extracting):\s+(.+)', line)
+                    if m:
+                        p = Path(m.group(1).strip())
+                        if p.exists():
+                            extracted.append(p)
+                if delete_zip:
+                    zp.unlink(missing_ok=True)
+                    z01.unlink(missing_ok=True)
+                    logger.info("Removed split archive parts: %s, %s", z01.name, zp.name)
+            except FileNotFoundError:
+                logger.error("'unzip' not found — cannot extract split archive %s", zp.name)
+            except Exception as e:
+                logger.error("Error extracting split archive %s: %s", zp, e)
+        else:
+            logger.info("Extracting %s …", zp.name)
+            try:
+                with zipfile.ZipFile(zp) as zf:
+                    for member in zf.namelist():
+                        fname = Path(member).name
+                        if not fname:
+                            continue  # skip directory entries
+                        dest = out_dir / fname
+                        if dest.exists():
+                            logger.debug("  skip (exists): %s", fname)
+                            extracted.append(dest)
+                            continue
+                        dest.write_bytes(zf.read(member))
                         extracted.append(dest)
-                        continue
-                    dest.write_bytes(zf.read(member))
-                    extracted.append(dest)
-                    logger.debug("  → %s", fname)
-            if delete_zip:
-                zp.unlink()
-                logger.info("Removed zip: %s", zp.name)
-        except zipfile.BadZipFile as e:
-            logger.error("Bad zip %s: %s", zp, e)
-        except Exception as e:
-            logger.error("Error extracting %s: %s", zp, e)
+                        logger.debug("  → %s", fname)
+                if delete_zip:
+                    zp.unlink()
+                    logger.info("Removed zip: %s", zp.name)
+            except zipfile.BadZipFile as e:
+                logger.error("Bad zip %s: %s", zp, e)
+            except Exception as e:
+                logger.error("Error extracting %s: %s", zp, e)
 
     logger.info("Extracted %d file(s) from %d zip(s)", len(extracted), len(zip_files))
     return extracted
