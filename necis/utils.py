@@ -74,22 +74,32 @@ def extract_zips(
     for zp in zip_files:
         z01 = zp.with_suffix(".z01")
         if z01.exists():
-            # Split archive — both parts present; unzip handles reassembly automatically
-            # when .z01 is in the same directory as .zip.
-            logger.info("Extracting split archive %s + %s …", z01.name, zp.name)
+            # Split archive — unzip/zipfile don't support multi-disk ZIP; concatenate
+            # the parts (.z01 then .zip) into a single file and extract with bsdtar.
+            combined = zp.with_name(zp.stem + "_combined.zip")
+            logger.info("Concatenating %s + %s → %s …", z01.name, zp.name, combined.name)
             try:
+                with combined.open("wb") as out_f:
+                    for part in (z01, zp):
+                        with part.open("rb") as in_f:
+                            shutil.copyfileobj(in_f, out_f)
+                logger.info("Combined: %.1f MB", combined.stat().st_size / 1e6)
+
                 result = subprocess.run(
-                    ["unzip", "-o", str(zp), "-d", str(out_dir)],
-                    capture_output=True, text=True, cwd=str(zp.parent),
+                    ["bsdtar", "-xvf", str(combined.resolve()),
+                     "-C", str(out_dir.resolve())],
+                    capture_output=True, text=True,
                 )
+                combined.unlink(missing_ok=True)
+
                 if result.returncode != 0:
-                    logger.error("unzip failed for %s: %s", zp.name,
-                                 (result.stderr or result.stdout)[-500:])
+                    logger.error("bsdtar failed for %s: %s", zp.name,
+                                 result.stderr[-500:])
                     continue
-                for line in result.stdout.splitlines():
-                    m = re.match(r'\s+(?:inflating|extracting):\s+(.+)', line)
-                    if m:
-                        p = Path(m.group(1).strip())
+                # bsdtar -v writes extracted filenames to stderr ("x filename")
+                for line in result.stderr.splitlines():
+                    if line.startswith("x "):
+                        p = out_dir / line[2:].strip()
                         if p.exists():
                             extracted.append(p)
                 if delete_zip:
@@ -97,8 +107,9 @@ def extract_zips(
                     z01.unlink(missing_ok=True)
                     logger.info("Removed split archive parts: %s, %s", z01.name, zp.name)
             except FileNotFoundError:
-                logger.error("'unzip' not found — cannot extract split archive %s", zp.name)
+                logger.error("'bsdtar' not found — cannot extract split archive %s", zp.name)
             except Exception as e:
+                combined.unlink(missing_ok=True)
                 logger.error("Error extracting split archive %s: %s", zp, e)
         else:
             logger.info("Extracting %s …", zp.name)
