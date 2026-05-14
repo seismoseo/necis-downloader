@@ -1,12 +1,16 @@
 #!/bin/bash
 # run_daily.sh — Daily NECIS continuous waveform download (cron wrapper).
 #
-# Downloads all stations currently available on the NECIS page for 2 days ago.
-# No station CSV needed — stations are scraped from the NECIS DOM at runtime.
+# Downloads all KS stations in batches of 20 for 2 days ago.
 #
-# Targeting 2 days ago instead of yesterday ensures the requested UTC date is
-# fully complete at 1 AM KST (= 16:00 UTC of the previous day, well past UTC
-# midnight for the day-before-yesterday).
+# Batch approach (--batch-size 20, ~21 batches of ~600 MB each) is used because
+# NECIS now creates split ZIP archives (.z01 + .zip) for large all-stations
+# requests (~10 GB), and the history API leaves downloadPath empty for split
+# archives. Batching keeps each ZIP under the single-file threshold so the
+# download URL is always populated.
+#
+# Targeting 2 days ago ensures the requested UTC date is fully complete at 1 AM
+# KST (= 16:00 UTC previous day, well past UTC midnight for day-before-yesterday).
 #
 # Cron entry (1 AM KST every day):
 #   0 1 * * * /home/msseo/works/Claude/run_daily.sh >> /home/msseo/works/Claude/logs/necis.log 2>&1
@@ -14,11 +18,6 @@
 # Env overrides (set in .env or shell):
 #   CONTINUOUS_DIR   organized output root (default: data/necis/continuous)
 #   NECIS_USER / NECIS_PASS
-#
-# Notes:
-#   - NECIS allows ~10 GB/day. One full day of all KS stations ≈ 9.5 GB.
-#   - --max-wait 7200 (2 h): the server takes ~10–30 min to prepare a full-day zip.
-#   - --poll-interval 60: reduces polling noise for a single long-running job.
 
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -35,9 +34,11 @@ echo "=== $(date '+%Y-%m-%d %H:%M:%S') Daily NECIS download for $DATE ==="
 /home/msseo/miniforge3/envs/pipeline/bin/python download_continuous.py \
     --date           "$DATE" \
     --channels       HHZ,HHN,HHE \
+    --station-csv    /home/msseo/works/SGTL-SKP-workspace/meta/KP_station_list.csv \
+    --batch-size     20 \
     --fetch \
-    --poll-interval  60 \
-    --max-wait       7200 \
+    --poll-interval  30 \
+    --max-wait       600 \
     --organize \
     --continuous-dir "$CONTINUOUS_DIR"
 
