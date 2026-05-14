@@ -389,6 +389,10 @@ async def fetch_ready_downloads(
             "%d split archive record(s) detected — browsing FTP directory for parts",
             len(split_records),
         )
+        # Log all fields of the first split record so we can identify the
+        # request-ID field and use it for precise filtering in a future update.
+        logger.info("Split archive record fields: %s", split_records[0])
+
         # All split records share the same ftpUrl; collect unique bases
         ftp_bases = {(r.get("ftpUrl") or "").rstrip("/") for r in split_records}
         for ftp_base in ftp_bases:
