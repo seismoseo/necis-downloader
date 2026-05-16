@@ -90,6 +90,10 @@ def _parse_args():
                    help="Wait and fetch prepared zip files after request (default: on)")
     p.add_argument("--fetch-only",    action="store_true",
                    help="Skip the request step; poll history and download already-queued files")
+    p.add_argument("--submitted-after", metavar="DATETIME",
+                   help="With --fetch-only: only download jobs submitted after this datetime "
+                        "(format: 'YYYY-MM-DD HH:MM:SS' or 'YYYY-MM-DD'). "
+                        "Useful to avoid re-downloading old historical jobs.")
     p.add_argument("--poll-interval", type=int, default=30, metavar="SEC")
     p.add_argument("--max-wait",      type=int, default=600, metavar="SEC")
     p.add_argument("--organize",      action=argparse.BooleanOptionalAction, default=True,
@@ -179,7 +183,19 @@ def main():
     cont_root = Path(args.continuous_dir or "/home/msseo/works/Claude/data/necis/continuous")
 
     if args.fetch_only:
-        # Skip request; download whatever is already prepared in the history
+        submitted_after = None
+        if args.submitted_after:
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+                try:
+                    submitted_after = datetime.strptime(args.submitted_after, fmt)
+                    break
+                except ValueError:
+                    pass
+            if submitted_after is None:
+                sys.exit(f"Cannot parse --submitted-after: {args.submitted_after!r}  "
+                         "(expected 'YYYY-MM-DD HH:MM:SS' or 'YYYY-MM-DD')")
+            logger.info("fetch-only: limiting to jobs submitted after %s", submitted_after)
+
         async def _fetch_only():
             async with NECISBrowser(cfg) as browser:
                 files = await fetch_ready_downloads(
@@ -187,6 +203,7 @@ def main():
                     out_dir=zip_dir,
                     poll_interval=args.poll_interval,
                     max_wait=args.max_wait,
+                    submitted_after=submitted_after,
                 )
                 if args.organize and files:
                     organized = process_continuous_downloads(
