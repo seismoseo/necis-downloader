@@ -101,13 +101,17 @@ async def _poll_for_ready(
     cutoff = submitted_after.strftime("%Y-%m-%d %H:%M:%S") if submitted_after else None
     attempt = 0
 
+    consecutive_empty = 0  # successful polls that returned no jobs at all
+
     while True:
         attempt += 1
         try:
             records = _fetch_history_json(session, browser.cfg.base_url)
+            api_ok = True
         except Exception as e:
-            logger.warning("[poll #%d] History API error: %s", attempt, e)
+            logger.warning("[poll #%d] History API error: %s — will retry", attempt, e)
             records = []
+            api_ok = False
 
         # Filter to only records submitted after the cutoff time
         if cutoff:
@@ -127,10 +131,16 @@ async def _poll_for_ready(
         if ready:
             return ready
 
-        # Wait at least 2 polls before giving up: on the first poll the server
-        # may not have registered the newly submitted job yet.
-        if not processing and attempt >= 2:
-            logger.info("No jobs in progress after %d polls — nothing to wait for.", attempt)
+        # Only give up when we get consecutive *successful* empty responses — a
+        # transient API error must not be treated as "nothing in progress".
+        if api_ok and not processing:
+            consecutive_empty += 1
+        else:
+            consecutive_empty = 0  # reset on error or when a job is still running
+
+        if consecutive_empty >= 2:
+            logger.info("No jobs in progress after %d successful polls — nothing to wait for.",
+                        attempt)
             return []
 
         remaining = deadline - time.time()
