@@ -4,7 +4,7 @@ build-backend = "setuptools.backends.legacy:build"
 
 [project]
 name = "necis-downloader"
-version = "0.1.0"
+version = "1.0.0"
 description = "Automated seismic waveform download from the KMA NECIS portal"
 readme = "README.md"
 license = { text = "MIT" }

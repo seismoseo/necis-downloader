@@ -26,7 +26,7 @@ from .utils import (process_continuous_downloads, organize_continuous,
                     organize_events_kma, extract_zips)
 from .events import load_catalog, download_event, run_events
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
 
 __all__ = [
     "NECISConfig",
