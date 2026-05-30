@@ -19,6 +19,10 @@ import re
 import shutil
 import subprocess
 import zipfile
+
+# bsdtar may only be in the base conda env, not the active pipeline env
+_BSDTAR   = shutil.which("bsdtar")   or "/home/msseo/miniforge3/bin/bsdtar"
+_MSEED2SAC = shutil.which("mseed2sac") or "/home/msseo/bin/mseed2sac"
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -86,7 +90,7 @@ def extract_zips(
                 logger.info("Combined: %.1f MB", combined.stat().st_size / 1e6)
 
                 result = subprocess.run(
-                    ["bsdtar", "-xvf", str(combined.resolve()),
+                    [_BSDTAR, "-xvf", str(combined.resolve()),
                      "-C", str(out_dir.resolve())],
                     capture_output=True, text=True,
                 )
@@ -107,7 +111,9 @@ def extract_zips(
                     z01.unlink(missing_ok=True)
                     logger.info("Removed split archive parts: %s, %s", z01.name, zp.name)
             except FileNotFoundError:
-                logger.error("'bsdtar' not found — cannot extract split archive %s", zp.name)
+                combined.unlink(missing_ok=True)
+                logger.error("'bsdtar' not found at %s — cannot extract split archive %s",
+                             _BSDTAR, zp.name)
             except Exception as e:
                 combined.unlink(missing_ok=True)
                 logger.error("Error extracting split archive %s: %s", zp, e)
@@ -232,6 +238,77 @@ def organize_events(
         organized.append(dest)
 
     return organized
+
+
+def _convert_mseed_to_sac(mseed_dir: Path, sac_dir: Path) -> None:
+    """Run mseed2sac on KS.* miniSEED files, then sort .SAC files by channel band.
+
+    Band subdirectories match the kma_waveforms convention: HG/, BG/, LG/, HH/, etc.
+    The band is taken from the first two characters of the channel code (field [3]).
+    """
+    sac_dir.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        [_MSEED2SAC, "-i", "KS.*"],
+        cwd=str(mseed_dir),
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        logger.error("mseed2sac failed (exit %d): %s",
+                     result.returncode, result.stderr[-400:])
+    # Move *.SAC files produced in mseed_dir into sac_dir/{band}/
+    moved = 0
+    for sac_file in list(mseed_dir.glob("*.SAC")):
+        parts = sac_file.name.split(".")
+        # Filename: NET.STA..CHA.D.YYYY.DDD.HHMMSS.SAC  (parts[3] = channel)
+        band = parts[3][:2] if len(parts) >= 4 else "XX"
+        band_dir = sac_dir / band
+        band_dir.mkdir(exist_ok=True)
+        shutil.move(str(sac_file), band_dir / sac_file.name)
+        moved += 1
+    logger.info("Converted %d miniSEED → SAC in %s", moved, sac_dir)
+
+
+def organize_events_kma(
+    zip_dir: Path,
+    event_utc_str: str,
+    necis_id: str,
+    out_root: Path,
+    data_type: str = "a",
+    delete_zip: bool = True,
+    convert_sac: bool = True,
+) -> list[Path]:
+    """Extract a downloaded event ZIP and organize into the kma_waveforms layout.
+
+    Layout produced:
+      out_root/{event_utc_str}/{necis_id}.{data_type}/MSEED/  ← raw miniSEED
+      out_root/{event_utc_str}/{necis_id}.{data_type}/SAC/{band}/  ← SAC files
+
+    Parameters
+    ----------
+    zip_dir       : directory containing the downloaded ZIP(s) to extract
+    event_utc_str : UTC origin time string, e.g. '20230526113954' (outer dir)
+    necis_id      : NECIS internal event ID, e.g. '2023002939' (inner dir prefix)
+    out_root      : organized output root
+    data_type     : 'a' (acceleration) or 'v' (velocity)
+    delete_zip    : remove ZIP after successful extraction
+    convert_sac   : run mseed2sac to produce SAC files
+    """
+    mseed_dir = out_root / event_utc_str / f"{necis_id}.{data_type}" / "MSEED"
+    sac_dir   = out_root / event_utc_str / f"{necis_id}.{data_type}" / "SAC"
+    mseed_dir.mkdir(parents=True, exist_ok=True)
+
+    extracted = extract_zips(zip_dir, mseed_dir, delete_zip=delete_zip)
+    if not extracted:
+        logger.warning("No files extracted for event %s type=%s", event_utc_str, data_type)
+        return []
+
+    if convert_sac:
+        if shutil.which(_MSEED2SAC) or Path(_MSEED2SAC).exists():
+            _convert_mseed_to_sac(mseed_dir, sac_dir)
+        else:
+            logger.error("mseed2sac not found at %s — skipping SAC conversion", _MSEED2SAC)
+
+    return extracted
 
 
 def process_continuous_downloads(

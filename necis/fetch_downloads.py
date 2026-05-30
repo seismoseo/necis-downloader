@@ -241,6 +241,17 @@ def _download_file(session: requests.Session, url: str, out_dir: Path,
                 logger.info("Saved → %s  (%.1f MB)", dest, dest.stat().st_size / 1e6)
                 return dest
 
+        except requests.exceptions.HTTPError as http_err:
+            if http_err.response is not None and 400 <= http_err.response.status_code < 500:
+                logger.error("[attempt %d] Permanent HTTP %d for %s — giving up",
+                             attempt, http_err.response.status_code, url)
+                break
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            logger.warning("[attempt %d] %s — retrying in 30s (%.0fh remaining)",
+                           attempt, http_err, remaining / 3600)
+            time.sleep(min(30, remaining))
         except Exception as e:
             remaining = deadline - time.time()
             if remaining <= 0:
