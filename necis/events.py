@@ -15,27 +15,32 @@ them to match the kma_waveforms layout used in the Jangsung cluster project:
     RESP/
       {NECIS_ID}.r/               ← instrument response files
 
-NECIS event architecture (direct FTP, no request queue)
---------------------------------------------------------
-Event ZIPs are pre-packaged and available immediately on the NECIS FTP server:
-  http://ftp.necis.kma.go.kr:8080/EVENT/YYYY/JDAY/NECIS_ID/NECIS_ID.{a|v|r}.zip
+NECIS event download workflow (same queue mechanism as continuous waveforms)
+----------------------------------------------------------------------------
+1. Navigate to earthquake_event_map.do
+2. Set date filter (KST!) via page.evaluate (inputs are readonly jQuery datepicker)
+3. Click search button (fn_setTableList)
+4. Parse onclick attributes to find matched event:
+     fn_file_view('NECIS_ID', 'KST_DATETIME', lat, lon, 'a|v')  ← KST times
+     fn_file_download('EVENT/.../ID.a.zip|.../ID.r.zip', size)  ← source paths
+5. Trigger download via JS: fn_file_download(file_list, req_size)
+6. Wait for sizecheck modal → click "다운로드 요청" → NECIS queues the job
+7. Poll requestFilesHisAjax.do via fetch_ready_downloads
+8. Download result ZIP from FTP, extract, organize
 
-The event search page (earthquake_event_map.do) lists available events.
-Each row exposes onclick attributes:
-  fn_file_view('NECIS_ID', 'UTC_DATETIME', lat, lon, 'a|v')
-  fn_file_download('EVENT/YYYY/DDD/ID/ID.a.zip|EVENT/.../ID.r.zip', size)
-
-Date inputs are readonly jQuery datepicker fields — set via page.evaluate().
+Key observations:
+- fn_file_view datetime is KST → must convert to UTC for catalog matching
+- search date filter is also KST → use origin_time + 9h for the date string
+- fn_file_download invokes sizecheck AJAX then shows a modal; click btn_red to confirm
+- fn_download_request alerts after queuing; register dialog handler to auto-dismiss
 
 Catalog formats supported
 --------------------------
 Jangsung format (Year/Month/Day/Hour/Minute/Second columns, KST):
   Year,Month,Day,Hour,Minute,Second,Latitude,Longitude,Depth,Magnitude
-  2023,5,26,20,39,54,35.46,126.81,8,1.1
 
 KMA catalog format (datetime column, UTC):
   datetime,event_id,...
-  2016-01-01 17:27:10,201601_0001,...
 """
 
 from __future__ import annotations
@@ -43,7 +48,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -51,18 +56,17 @@ import pandas as pd
 
 from .browser import NECISBrowser
 from .config import NECISConfig
-from .fetch_downloads import _copy_cookies_to_session, _download_file
+from .fetch_downloads import fetch_ready_downloads
 
 logger = logging.getLogger(__name__)
 
 # NECIS event waveform search page
 EVENTS_PAGE_URL = "/necis-dbf/user/earthquake/earthquake_event_map.do"
 
-# FTP base for event ZIPs (same host as continuous waveform FTP)
-FTP_BASE = "http://ftp.necis.kma.go.kr:8080"
-
 # Tolerance for matching catalog events to NECIS page rows (seconds)
 TIME_MATCH_TOL_S = 10
+
+_KST_OFFSET = timedelta(hours=9)
 
 
 # ---------------------------------------------------------------------------
@@ -129,8 +133,8 @@ def load_catalog(csv_path: Path, tz_offset_hours: int = 9) -> pd.DataFrame:
 def _parse_fn_file_view(onclick: str) -> tuple[Optional[str], Optional[datetime]]:
     """Extract (necis_id, utc_datetime) from fn_file_view onclick.
 
-    Pattern: fn_file_view('2023002939', '2023-05-26 11:39:54', ...)
-    The datetime is UTC as displayed on the NECIS event page.
+    Pattern: fn_file_view('2023002939', '2023-05-26 20:39:54', ...)
+    The datetime is KST — converted to UTC before returning.
     """
     m = re.search(
         r"fn_file_view\(\s*'([^']+)'\s*,\s*'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})'",
@@ -139,23 +143,23 @@ def _parse_fn_file_view(onclick: str) -> tuple[Optional[str], Optional[datetime]
     if not m:
         return None, None
     try:
-        utc_dt = datetime.strptime(m.group(2), "%Y-%m-%d %H:%M:%S")
+        kst_dt = datetime.strptime(m.group(2), "%Y-%m-%d %H:%M:%S")
+        utc_dt = kst_dt - _KST_OFFSET
     except ValueError:
         return None, None
     return m.group(1).strip(), utc_dt
 
 
-def _parse_fn_file_download(onclick: str) -> list[str]:
-    """Extract FTP path list from fn_file_download onclick.
+def _parse_fn_file_download(onclick: str) -> tuple[Optional[str], Optional[str]]:
+    """Extract (file_list, req_size) from fn_file_download onclick.
 
-    Pattern: fn_file_download('EVENT/2023/146/2023002939/2023002939.a.zip|
-                                EVENT/2023/146/2023002939/2023002939.r.zip', size)
-    Returns list of FTP relative paths (pipe-separated in the onclick attribute).
+    Pattern: fn_file_download('EVENT/.../ID.a.zip|.../ID.r.zip', '49799848')
+    file_list is the pipe-separated FTP source path string passed to the queue.
     """
-    m = re.search(r"fn_file_download\(\s*'([^']+)'", onclick)
+    m = re.search(r"fn_file_download\(\s*'([^']+)'\s*,\s*'([^']+)'", onclick)
     if not m:
-        return []
-    return [p.strip() for p in m.group(1).split("|") if p.strip()]
+        return None, None
+    return m.group(1).strip(), m.group(2).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -168,14 +172,17 @@ async def _search_event(
 ) -> Optional[dict]:
     """Search the NECIS event page and return download info for the matching event.
 
-    Sets readonly date filter fields via JavaScript (bypasses jQuery datepicker),
-    submits the search, then parses fn_file_view / fn_file_download onclick
-    attributes from the results to find the event nearest to origin_time.
+    Sets readonly date filter fields via JavaScript using the KST date (NECIS
+    organizes events by KST date, not UTC).  Submits the search, then parses
+    fn_file_view / fn_file_download onclick attributes from the results.
 
     Returns a dict:
-      necis_id  : NECIS internal event ID, e.g. '2023002939'
-      ftp_paths : list of relative FTP paths (deduplicated)
-    or None if no match within TIME_MATCH_TOL_S seconds.
+      necis_id      : NECIS internal event ID string, e.g. '2023002939'
+      type_downloads: {
+          "a": {"file_list": "EVENT/.../ID.a.zip|.../ID.r.zip", "req_size": "49799848"},
+          "v": {"file_list": "EVENT/.../ID.v.zip|.../ID.r.zip", "req_size": "24191030"},
+      }
+    or None if no match found within TIME_MATCH_TOL_S seconds.
     """
     await browser.page.goto(
         browser.cfg.base_url + EVENTS_PAGE_URL,
@@ -184,22 +191,24 @@ async def _search_event(
     )
     await asyncio.sleep(2)
 
-    date_str = origin_time.strftime("%Y-%m-%d")
+    # Use a 2-day UTC window (UTC date → UTC date+1) to reliably capture the event
+    # regardless of the KST/UTC boundary.  NECIS shows fn_file_view times in KST but
+    # the single-day filter can miss events that straddle the UTC/KST midnight boundary.
+    start_str = origin_time.strftime("%Y-%m-%d")
+    end_str   = (origin_time + timedelta(days=1)).strftime("%Y-%m-%d")
 
-    # Date inputs are readonly jQuery datepicker fields — remove readonly and set value
     try:
         await browser.page.evaluate(
-            "([d]) => {"
-            "  var inputs = ['startDate', 'endDate'];"
-            "  inputs.forEach(function(name) {"
-            "    var el = document.querySelector('input[name=\"' + name + '\"]');"
-            "    if (el) { el.removeAttribute('readonly'); el.value = d; }"
-            "  });"
+            "([s, e]) => {"
+            "  var sf = document.querySelector('input[name=\"startDate\"]');"
+            "  var ef = document.querySelector('input[name=\"endDate\"]');"
+            "  if (sf) { sf.removeAttribute('readonly'); sf.value = s; }"
+            "  if (ef) { ef.removeAttribute('readonly'); ef.value = e; }"
             "}",
-            [date_str],
+            [start_str, end_str],
         )
     except Exception as e:
-        logger.error("Could not set date fields for %s: %s", date_str, e)
+        logger.error("Could not set date fields for %s–%s: %s", start_str, end_str, e)
         return None
 
     # Click the search button
@@ -211,7 +220,7 @@ async def _search_event(
         await search_btn.click()
         await asyncio.sleep(3)
     except Exception as e:
-        logger.error("Search click failed for %s: %s", date_str, e)
+        logger.error("Search click failed for %s–%s: %s", start_str, end_str, e)
         return None
 
     # Collect all onclick attributes from the page
@@ -234,7 +243,7 @@ async def _search_event(
     download_attrs = [a for a in onclick_texts if "fn_file_download" in a]
 
     if not view_attrs:
-        logger.warning("No events found on NECIS page for date %s", date_str)
+        logger.warning("No events found on NECIS page for UTC window %s–%s", start_str, end_str)
         return None
 
     # Find the row whose UTC time is closest to origin_time
@@ -248,15 +257,15 @@ async def _search_event(
         diff = abs((row_utc - origin_time).total_seconds())
         if diff < best_diff:
             best_diff = diff
-            # Collect all FTP paths that reference this NECIS ID (deduplicated)
-            seen: set[str] = set()
-            paths: list[str] = []
+            # Collect fn_file_download info for this NECIS ID, keyed by type
+            type_downloads: dict[str, dict] = {}
             for da in download_attrs:
-                for p in _parse_fn_file_download(da):
-                    if necis_id in p and p not in seen:
-                        seen.add(p)
-                        paths.append(p)
-            best = {"necis_id": necis_id, "row_utc": row_utc, "ftp_paths": paths}
+                file_list, req_size = _parse_fn_file_download(da)
+                if file_list and necis_id in file_list:
+                    name = file_list.split("|")[0].rstrip("/").rsplit("/", 1)[-1]
+                    if   name.endswith(".a.zip"): type_downloads["a"] = {"file_list": file_list, "req_size": req_size}
+                    elif name.endswith(".v.zip"): type_downloads["v"] = {"file_list": file_list, "req_size": req_size}
+            best = {"necis_id": necis_id, "row_utc": row_utc, "type_downloads": type_downloads}
 
     if best is None or best_diff > TIME_MATCH_TOL_S:
         logger.warning(
@@ -266,8 +275,11 @@ async def _search_event(
         return None
 
     logger.info(
-        "Matched NECIS event %s (Δ%.0fs, %d FTP path(s))",
-        best["necis_id"], best_diff, len(best["ftp_paths"]),
+        "Matched NECIS event %s (KST %s, Δ%.0fs, types=%s)",
+        best["necis_id"],
+        (best["row_utc"] + _KST_OFFSET).strftime("%Y-%m-%d %H:%M:%S"),
+        best_diff,
+        list(best["type_downloads"].keys()),
     )
     return best
 
@@ -287,11 +299,11 @@ async def download_event(
 ) -> dict[str, list[Path]]:
     """Download waveforms for a single event (acceleration and/or velocity).
 
-    Locates the event on the NECIS event page, then directly downloads the
-    pre-packaged ZIP files from the NECIS FTP server.  No request queue is
-    used — event ZIPs are always pre-available on FTP.
+    Uses the same queue workflow as continuous waveforms:
+      fn_file_download → sizecheck → modal → "다운로드 요청" → poll → FTP download
 
-    Also downloads the RESP (.r.zip) file into out_root/RESP/{necis_id}.r/.
+    One queue request is submitted per data type; NECIS packages the result
+    and the history API returns the download URL when ready.
 
     Parameters
     ----------
@@ -302,7 +314,7 @@ async def download_event(
     out_root    : organized output root (default: cfg.download_dir/events)
     convert_sac : convert miniSEED → SAC via mseed2sac after extraction
     """
-    from .utils import extract_zips, organize_events_kma
+    from .utils import organize_events_kma
 
     zip_dir  = zip_dir  or (browser.cfg.download_dir / "events" / "zips")
     out_root = out_root or (browser.cfg.download_dir / "events")
@@ -319,44 +331,76 @@ async def download_event(
     if not remaining:
         return {}
 
-    info = await _search_event(browser, origin_time)
-    if info is None:
-        logger.warning("[%s] Event not found on NECIS — skipping", event_id)
-        return {}
-
-    necis_id  = info["necis_id"]
-    ftp_paths = info["ftp_paths"]
-
-    # Categorize FTP paths by data type suffix
-    type_paths: dict[str, list[str]] = {"a": [], "v": [], "r": []}
-    for p in ftp_paths:
-        name = p.rstrip("/").rsplit("/", 1)[-1]
-        if   name.endswith(".a.zip"): type_paths["a"].append(p)
-        elif name.endswith(".v.zip"): type_paths["v"].append(p)
-        elif name.endswith(".r.zip"): type_paths["r"].append(p)
-
-    session = await _copy_cookies_to_session(browser)
     results: dict[str, list[Path]] = {}
 
-    # Download waveform ZIPs (.a and/or .v)
     for dt in remaining:
-        paths = type_paths.get(dt, [])
-        if not paths:
-            logger.warning("[%s] No FTP path for data type '%s'", event_id, dt)
+        # Navigate to event page and find the event
+        # (search is repeated per data type since fetch_ready_downloads navigates away)
+        info = await _search_event(browser, origin_time)
+        if info is None:
+            logger.warning("[%s] Event not found on NECIS — skipping %s", event_id, dt)
             continue
 
+        necis_id = info["necis_id"]
+        dl = info["type_downloads"].get(dt)
+        if dl is None:
+            logger.warning("[%s] No fn_file_download found for type '%s'", event_id, dt)
+            continue
+
+        # Auto-dismiss the JavaScript alert that fn_download_request fires after queuing
+        async def _handle_dialog(dialog: object) -> None:
+            await dialog.accept()  # type: ignore[attr-defined]
+
+        browser.page.on("dialog", _handle_dialog)
+        submitted_after = datetime.now()
+
+        try:
+            # Trigger fn_file_download → sizecheck AJAX → modal appears
+            await browser.page.evaluate(
+                "([fl, rs]) => { fn_file_download(fl, rs); }",
+                [dl["file_list"], dl["req_size"]],
+            )
+            await asyncio.sleep(2)  # wait for sizecheck AJAX to complete
+
+            # Check for the confirm button; if absent the quota was exceeded.
+            # Use JS eval to click — the modal overlay intercepts Playwright pointer events.
+            clicked = await browser.page.evaluate("""() => {
+                var btn = document.querySelector('#fileMgrModal a.btn_red');
+                if (btn) { btn.click(); return 'clicked'; }
+                var info = document.querySelector('#fileMgrModal .info');
+                return 'denied:' + (info ? info.innerText.trim() : 'quota exceeded');
+            }""")
+
+            if not clicked or not clicked.startswith("clicked"):
+                logger.warning(
+                    "[%s] Sizecheck denied for '%s' — %s", event_id, dt, clicked
+                )
+                await browser.page.evaluate(
+                    "() => { var b = document.querySelector('#fileMgrModal a.btn_gray'); if(b) b.click(); }"
+                )
+                continue
+
+            await asyncio.sleep(3)  # let the AJAX call finish and alert auto-dismiss
+
+        except Exception as e:
+            logger.error("[%s] Download request failed for '%s': %s", event_id, dt, e)
+            continue
+        finally:
+            browser.page.remove_listener("dialog", _handle_dialog)
+
+        # Poll history API and download result ZIPs
         dt_zip_dir = zip_dir / event_id / dt
         dt_zip_dir.mkdir(parents=True, exist_ok=True)
 
-        downloaded = []
-        for ftp_path in paths:
-            url  = f"{FTP_BASE}/{ftp_path.lstrip('/')}"
-            saved = _download_file(session, url, dt_zip_dir)
-            if saved:
-                downloaded.append(saved)
-
-        if not downloaded:
-            logger.warning("[%s] Download failed for data type '%s'", event_id, dt)
+        files = await fetch_ready_downloads(
+            browser,
+            out_dir=dt_zip_dir,
+            poll_interval=30,
+            max_wait=600,
+            submitted_after=submitted_after,
+        )
+        if not files:
+            logger.warning("[%s] No files downloaded for type '%s'", event_id, dt)
             continue
 
         organized = organize_events_kma(
@@ -370,25 +414,6 @@ async def download_event(
         )
         results[dt] = organized
         logger.info("[%s] %s — organized %d file(s)", event_id, dt, len(organized))
-
-    # Download RESP ZIP (.r) — always, regardless of data_types filter
-    resp_paths = type_paths.get("r", [])
-    if resp_paths:
-        resp_zip_dir = zip_dir / event_id / "r"
-        resp_zip_dir.mkdir(parents=True, exist_ok=True)
-        resp_out = out_root / "RESP" / f"{necis_id}.r"
-        resp_out.mkdir(parents=True, exist_ok=True)
-
-        already_extracted = any(resp_out.iterdir()) if resp_out.exists() else False
-        if already_extracted:
-            logger.info("[%s] RESP already extracted — skipping", event_id)
-        else:
-            for ftp_path in resp_paths:
-                url = f"{FTP_BASE}/{ftp_path.lstrip('/')}"
-                saved = _download_file(session, url, resp_zip_dir)
-                if saved:
-                    extract_zips(resp_zip_dir, resp_out, delete_zip=True)
-                    logger.info("[%s] RESP → %s", event_id, resp_out)
 
     return results
 
@@ -444,7 +469,7 @@ async def run_events(
     if stations:
         logger.info(
             "Note: --stations/%d and --pre/--post are not used for event download "
-            "(NECIS pre-packages all KS stations with a fixed time window).",
+            "(NECIS packages all KS stations with a fixed time window).",
             len(stations),
         )
 

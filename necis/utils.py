@@ -247,8 +247,12 @@ def _convert_mseed_to_sac(mseed_dir: Path, sac_dir: Path) -> None:
     The band is taken from the first two characters of the channel code (field [3]).
     """
     sac_dir.mkdir(parents=True, exist_ok=True)
+    ks_files = sorted(mseed_dir.glob("KS.*"))
+    if not ks_files:
+        logger.warning("No KS.* files in %s — skipping SAC conversion", mseed_dir)
+        return
     result = subprocess.run(
-        [_MSEED2SAC, "-i", "KS.*"],
+        [_MSEED2SAC] + [f.name for f in ks_files],
         cwd=str(mseed_dir),
         capture_output=True, text=True,
     )
@@ -301,6 +305,18 @@ def organize_events_kma(
     if not extracted:
         logger.warning("No files extracted for event %s type=%s", event_utc_str, data_type)
         return []
+
+    # NECIS queue wraps the source ZIP in an outer ZIP — extract any nested ZIPs in place
+    inner_zips = [f for f in extracted if f.suffix.lower() == ".zip" and f.exists()]
+    if inner_zips:
+        logger.info("Extracting %d nested ZIP(s) inside MSEED dir …", len(inner_zips))
+        nested = extract_zips(mseed_dir, mseed_dir, delete_zip=True)
+        # Replace `extracted` with the actual miniSEED files
+        extracted = [f for f in nested if f.suffix.lower() != ".zip"]
+        if not extracted:
+            logger.warning("No miniSEED files after nested extraction for %s/%s",
+                           event_utc_str, data_type)
+            return []
 
     if convert_sac:
         if shutil.which(_MSEED2SAC) or Path(_MSEED2SAC).exists():
