@@ -6,8 +6,7 @@ Information System) using Python and Playwright.
 
 > **Status**
 > Continuous waveforms ✅ working &nbsp;·&nbsp;
-> Event waveforms ⚠️ selectors need one-time configuration
-> (see [Event Waveforms](#event-waveforms))
+> Event waveforms ✅ working
 
 ---
 
@@ -201,26 +200,86 @@ job, avoiding accidental re-downloads of old queued jobs.
 
 ## Event Waveforms
 
-Event waveform download (`download_events.py` / `necis/events.py`) is
-implemented but requires one-time selector configuration:
+`download_events.py` downloads event waveforms from the NECIS earthquake catalog
+page and organizes them to match the `kma_waveforms` directory layout used in
+KMA seismological workflows.
 
-```bash
-# 1. Run the discovery tool — browser opens so you can navigate to the event page
-NECIS_HEADLESS=0 python discover_necis.py
+### Catalog formats
 
-# 2. Note the actual CSS selectors from the printed element list,
-#    then update the ADAPT constants at the top of necis/events.py
+**Jangsung / split-column format (KST times):**
+```
+Year,Month,Day,Hour,Minute,Second,Latitude,Longitude,Depth,Magnitude
+2023,5,26,20,39,54,35.46,126.81,8,1.1
+```
+Times are interpreted as KST and converted to UTC automatically.
 
-# 3. Download events from a KMA catalog CSV
-python download_events.py \
-    --catalog meta/catalog_KMA_20160101-20260203.csv \
-    --start 2026-01-01 --end 2026-03-31 \
-    --min-mag 3.0 \
-    --stations ADOA,AGSA \
-    --pre 30 --post 120
+**KMA catalog format (UTC datetime):**
+```
+datetime,event_id,...
+2016-01-01 17:27:10,201601_0001,...
 ```
 
-Output: `data/necis/events/YYYY/<event_id>/NET.STA.CHA.*`
+### Usage
+
+```bash
+# Jangsung-style catalog, all events
+python download_events.py \
+    --catalog event_catalog.csv
+
+# KMA catalog, date/magnitude filter, acceleration only
+python download_events.py \
+    --catalog meta/catalog_KMA_20160101-20260203.csv \
+    --start 2024-01-01 --end 2024-12-31 \
+    --min-mag 2.0 \
+    --data-type a
+
+# Velocity only, skip SAC conversion
+python download_events.py \
+    --catalog event_catalog.csv \
+    --data-type v --no-convert-sac
+```
+
+`--stations` and `--pre`/`--post` are accepted for API compatibility but have
+no effect — NECIS event ZIPs include all available KS stations with the server's
+default time window.
+
+### Output layout
+
+```
+data/necis/events/
+  20230526113954/            ← UTC origin time (YYYYMMDDHHmmss)
+    2023002939.a/            ← NECIS ID + .a (acceleration)
+      MSEED/
+        KS.ADOA.HGE.2023.146.11.39.54
+        KS.ADOA.HGZ.2023.146.11.39.54
+        ...
+      SAC/
+        BG/  KS.ADOA..BGE.D.2023.146....SAC
+        HG/  KS.ADOA..HGE.D.2023.146....SAC
+    2023002939.v/            ← same NECIS ID + .v (velocity)
+      MSEED/  ...
+      SAC/  BH/  HH/  ...
+```
+
+The outer directory name is the UTC origin time; the inner name is the NECIS
+internal event ID (e.g. `2023002939`) with `.a` or `.v` suffix. SAC files are
+sorted into band sub-directories (`BG/`, `HG/`, `HH/`, …) matching the standard
+`kma_waveforms` layout.
+
+### `download_events.py` options
+
+```
+--catalog PATH          Path to event catalog CSV (required)
+--start YYYY-MM-DD      Filter by UTC origin time (≥)
+--end   YYYY-MM-DD      Filter by UTC origin time (≤)
+--min-mag FLOAT         Skip events below this magnitude (default: 0)
+--data-type {a,v,both}  Acceleration, velocity, or both (default: both)
+--convert-sac           Convert miniSEED → SAC via mseed2sac (default: on)
+--no-convert-sac        Skip SAC conversion
+--output-dir PATH       Organized output root (default: data/necis/events)
+--poll-interval SEC     Seconds between download queue polls (default: 30)
+--max-wait SEC          Max wait per download job (default: 600)
+```
 
 ---
 
@@ -259,8 +318,6 @@ necis-downloader/
 - **Server throughput:** The NECIS FTP server delivers at ~0.5 MB/s and
   frequently drops connections mid-transfer. The downloader resumes via HTTP
   Range requests; expect 6–12 hours to download a full day of all-station data.
-- **Event selectors** in `necis/events.py` have `# ADAPT` placeholders that
-  must be filled in after a live `discover_necis.py` run.
 - Requires an active NECIS account (KMA employee or registered researcher).
 
 ---
