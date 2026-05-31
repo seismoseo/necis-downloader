@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -56,7 +57,7 @@ import pandas as pd
 
 from .browser import NECISBrowser
 from .config import NECISConfig
-from .fetch_downloads import fetch_ready_downloads
+from .fetch_downloads import fetch_ready_downloads, _copy_cookies_to_session
 
 logger = logging.getLogger(__name__)
 
@@ -130,24 +131,27 @@ def load_catalog(csv_path: Path, tz_offset_hours: int = 9) -> pd.DataFrame:
 # onclick attribute parsers
 # ---------------------------------------------------------------------------
 
-def _parse_fn_file_view(onclick: str) -> tuple[Optional[str], Optional[datetime]]:
-    """Extract (necis_id, utc_datetime) from fn_file_view onclick.
+def _parse_fn_file_view(onclick: str) -> tuple[Optional[str], Optional[datetime], Optional[str]]:
+    """Extract (necis_id, utc_datetime, data_type) from fn_file_view onclick.
 
-    Pattern: fn_file_view('2023002939', '2023-05-26 20:39:54', ...)
+    Pattern: fn_file_view('2023002939', '2023-05-26 20:39:54', lat, lon, 'a')
     The datetime is KST — converted to UTC before returning.
+    data_type is the last argument: 'a' (acceleration) or 'v' (velocity).
     """
     m = re.search(
-        r"fn_file_view\(\s*'([^']+)'\s*,\s*'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})'",
+        r"fn_file_view\(\s*'([^']+)'\s*,\s*'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})'"
+        r".*?,\s*'([av])'",
         onclick,
+        re.DOTALL,
     )
     if not m:
-        return None, None
+        return None, None, None
     try:
         kst_dt = datetime.strptime(m.group(2), "%Y-%m-%d %H:%M:%S")
         utc_dt = kst_dt - _KST_OFFSET
     except ValueError:
-        return None, None
-    return m.group(1).strip(), utc_dt
+        return None, None, None
+    return m.group(1).strip(), utc_dt, m.group(3)
 
 
 def _parse_fn_file_download(onclick: str) -> tuple[Optional[str], Optional[str]]:
@@ -239,33 +243,47 @@ async def _search_event(
         logger.error("Could not collect onclick attributes: %s", e)
         return None
 
-    view_attrs     = [a for a in onclick_texts if "fn_file_view"     in a]
-    download_attrs = [a for a in onclick_texts if "fn_file_download" in a]
+    view_attrs = [a for a in onclick_texts if "fn_file_view" in a]
 
     if not view_attrs:
         logger.warning("No events found on NECIS page for UTC window %s–%s", start_str, end_str)
         return None
+
+    # Pair fn_file_download + fn_file_view by sequential position — they appear as
+    # adjacent pairs in both old (wf/event/...) and new (EVENT/...) page formats.
+    # The type ('a' or 'v') comes from the last arg of fn_file_view, NOT from the
+    # file path, so this works regardless of the path format used by the server.
+    all_downloads: dict[str, dict[str, dict]] = {}
+    i = 0
+    while i < len(onclick_texts):
+        oc = onclick_texts[i]
+        if "fn_file_download" in oc and i + 1 < len(onclick_texts) and "fn_file_view" in onclick_texts[i + 1]:
+            file_list, req_size = _parse_fn_file_download(oc)
+            necis_id_v, _, dt = _parse_fn_file_view(onclick_texts[i + 1])
+            if file_list and necis_id_v and dt:
+                all_downloads.setdefault(necis_id_v, {})[dt] = {
+                    "file_list": file_list, "req_size": req_size,
+                }
+            i += 2
+            continue
+        i += 1
 
     # Find the row whose UTC time is closest to origin_time
     best: Optional[dict] = None
     best_diff = float("inf")
 
     for va in view_attrs:
-        necis_id, row_utc = _parse_fn_file_view(va)
+        necis_id, row_utc, _ = _parse_fn_file_view(va)
         if necis_id is None or row_utc is None:
             continue
         diff = abs((row_utc - origin_time).total_seconds())
         if diff < best_diff:
             best_diff = diff
-            # Collect fn_file_download info for this NECIS ID, keyed by type
-            type_downloads: dict[str, dict] = {}
-            for da in download_attrs:
-                file_list, req_size = _parse_fn_file_download(da)
-                if file_list and necis_id in file_list:
-                    name = file_list.split("|")[0].rstrip("/").rsplit("/", 1)[-1]
-                    if   name.endswith(".a.zip"): type_downloads["a"] = {"file_list": file_list, "req_size": req_size}
-                    elif name.endswith(".v.zip"): type_downloads["v"] = {"file_list": file_list, "req_size": req_size}
-            best = {"necis_id": necis_id, "row_utc": row_utc, "type_downloads": type_downloads}
+            best = {
+                "necis_id": necis_id,
+                "row_utc": row_utc,
+                "type_downloads": all_downloads.get(necis_id, {}),
+            }
 
     if best is None or best_diff > TIME_MATCH_TOL_S:
         logger.warning(
@@ -347,46 +365,66 @@ async def download_event(
             logger.warning("[%s] No fn_file_download found for type '%s'", event_id, dt)
             continue
 
-        # Auto-dismiss the JavaScript alert that fn_download_request fires after queuing
-        async def _handle_dialog(dialog: object) -> None:
-            await dialog.accept()  # type: ignore[attr-defined]
+        # Submit the download request directly from Python so we can set
+        # X-Requested-With: XMLHttpRequest — required by the server for old-format
+        # wf/event/... file paths (new-format EVENT/... paths also accept this).
+        session = await _copy_cookies_to_session(browser)
+        fdp = await browser.page.evaluate(
+            "() => typeof fileDownloadParams !== 'undefined' ? fileDownloadParams : ''"
+        )
+        # Old-format paths (wf/event/...) are legacy NECIS paths that the current
+        # /download/part/ endpoint rejects (returns HTML even with the XHR header).
+        # The /download/all/ endpoint accepts them but packages ALL sensors for the
+        # date window rather than the specific requested file, so it delivers wrong data.
+        # No automated workaround exists — skip and warn.
+        if dl["file_list"].startswith("wf/"):
+            logger.warning(
+                "[%s] Skipping '%s' — old-format path (wf/event/...) is not supported "
+                "by the current NECIS download API.  Download manually via the NECIS web UI.",
+                event_id, dt,
+            )
+            continue
 
-        browser.page.on("dialog", _handle_dialog)
-        submitted_after = datetime.now()
+        req_size_mb = str(math.ceil(int(dl["req_size"]) / 1024 / 1024))
+        ajax_headers = {
+            "X-Requested-With": "XMLHttpRequest",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        sc_url = browser.cfg.base_url + (
+            "/necis-dbf/user/fileDownload/sizecheck/part/eventwavefilesNewAjax.do"
+        )
+        dl_url = browser.cfg.base_url + (
+            f"/necis-dbf/user/fileDownload/download/part/eventwavefilesNewAjax.do?{fdp}"
+        )
+        sc_params = {"fileList": dl["file_list"], "reqSize": req_size_mb,
+                     "fileCnt": "1", "chkEarth": "0"}
 
         try:
-            # Trigger fn_file_download → sizecheck AJAX → modal appears
-            await browser.page.evaluate(
-                "([fl, rs]) => { fn_file_download(fl, rs); }",
-                [dl["file_list"], dl["req_size"]],
-            )
-            await asyncio.sleep(2)  # wait for sizecheck AJAX to complete
+            sc_resp = session.post(sc_url, data=sc_params, headers=ajax_headers, timeout=30)
+            sc = sc_resp.json()
+        except Exception as e:
+            logger.error("[%s] Sizecheck failed for '%s': %s", event_id, dt, e)
+            continue
 
-            # Check for the confirm button; if absent the quota was exceeded.
-            # Use JS eval to click — the modal overlay intercepts Playwright pointer events.
-            clicked = await browser.page.evaluate("""() => {
-                var btn = document.querySelector('#fileMgrModal a.btn_red');
-                if (btn) { btn.click(); return 'clicked'; }
-                var info = document.querySelector('#fileMgrModal .info');
-                return 'denied:' + (info ? info.innerText.trim() : 'quota exceeded');
-            }""")
+        if sc.get("result") != "Y":
+            logger.warning("[%s] Sizecheck denied for '%s': %s", event_id, dt, sc.get("msg", ""))
+            continue
 
-            if not clicked or not clicked.startswith("clicked"):
-                logger.warning(
-                    "[%s] Sizecheck denied for '%s' — %s", event_id, dt, clicked
-                )
-                await browser.page.evaluate(
-                    "() => { var b = document.querySelector('#fileMgrModal a.btn_gray'); if(b) b.click(); }"
-                )
-                continue
-
-            await asyncio.sleep(3)  # let the AJAX call finish and alert auto-dismiss
-
+        dl_params = {"fileList": dl["file_list"], "reqSize": sc.get("reqSize", req_size_mb),
+                     "fileCnt": "1", "chkEarth": "0"}
+        submitted_after = datetime.now()
+        try:
+            dl_resp = session.post(dl_url, data=dl_params, headers=ajax_headers, timeout=30)
+            dl_data = dl_resp.json()
         except Exception as e:
             logger.error("[%s] Download request failed for '%s': %s", event_id, dt, e)
             continue
-        finally:
-            browser.page.remove_listener("dialog", _handle_dialog)
+
+        if dl_data.get("result") != "Y":
+            logger.warning("[%s] Download request denied for '%s': %s",
+                           event_id, dt, dl_data.get("msg", ""))
+            continue
+        logger.info("[%s] %s queued: %s", event_id, dt, dl_data.get("msg", "")[:80])
 
         # Poll history API and download result ZIPs
         dt_zip_dir = zip_dir / event_id / dt
