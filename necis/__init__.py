@@ -11,7 +11,8 @@ fetch_ready_downloads     poll history API and stream-download prepared zips
 run_fetch                 convenience runner for fetch step
 process_continuous_downloads  extract zips and organize into YYYY/STA/ tree
 organize_continuous       organize extracted miniSEED files into date tree
-organize_events_kma       extract + organize event ZIPs into kma_waveforms layout
+organize_events_kma           extract + organize event ZIPs into kma_waveforms layout
+organize_old_event_by_channel  same but routes a+v by channel band (old-format events)
 extract_zips              unzip downloaded archives
 load_catalog              read event catalog CSV (Jangsung or KMA format)
 download_event            download waveforms for a single event
@@ -23,7 +24,7 @@ from .browser import NECISBrowser
 from .continuous import request_day, run_continuous
 from .fetch_downloads import fetch_ready_downloads, run_fetch
 from .utils import (process_continuous_downloads, organize_continuous,
-                    organize_events_kma, extract_zips)
+                    organize_events_kma, organize_old_event_by_channel, extract_zips)
 from .events import load_catalog, download_event, run_events
 
 __version__ = "1.0.0"
@@ -38,6 +39,7 @@ __all__ = [
     "process_continuous_downloads",
     "organize_continuous",
     "organize_events_kma",
+    "organize_old_event_by_channel",
     "extract_zips",
     "load_catalog",
     "download_event",

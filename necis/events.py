@@ -306,6 +306,62 @@ async def _search_event(
 # Per-event downloader
 # ---------------------------------------------------------------------------
 
+async def _submit_via_checkbox(
+    browser: NECISBrowser,
+    necis_id: str,
+    event_id: str,
+) -> Optional[datetime]:
+    """Trigger a 'part' download for a single event via the page checkbox.
+
+    Finds the table row whose onclick contains necis_id, checks its checkbox,
+    calls fn_calc_download_size('part'), then clicks the modal confirm button.
+    Returns the submitted_after timestamp for fetch_ready_downloads, or None
+    if the sizecheck modal did not show a confirm button (result != 'Y').
+    """
+    chk_id: Optional[str] = await browser.page.evaluate(
+        """([nid]) => {
+            var els = document.querySelectorAll('[onclick]');
+            for (var i = 0; i < els.length; i++) {
+                var oc = els[i].getAttribute('onclick') || '';
+                if (oc.includes(nid)) {
+                    var tr = els[i].closest('tr');
+                    if (tr) {
+                        var chk = tr.querySelector('input[type=checkbox][name=chk]');
+                        return chk ? chk.id : null;
+                    }
+                }
+            }
+            return null;
+        }""",
+        [necis_id],
+    )
+    if not chk_id:
+        logger.error("[%s] Cannot find checkbox for NECIS ID %s", event_id, necis_id)
+        return None
+
+    await browser.page.check(f"#{chk_id}")
+    await asyncio.sleep(1)
+
+    async def _dismiss(d: object) -> None:
+        logger.info("[%s] dialog: %s", event_id, getattr(d, "message", "")[:80])
+        await d.accept()  # type: ignore[attr-defined]
+
+    browser.page.on("dialog", _dismiss)
+
+    await browser.page.evaluate("() => { fn_calc_download_size('part'); }")
+    await asyncio.sleep(3)
+
+    modal_btn = await browser.page.query_selector("#fileMgrModal a.btn_red")
+    if not modal_btn:
+        logger.warning("[%s] No confirm button in modal — sizecheck returned N", event_id)
+        return None
+
+    submitted_after = datetime.now()
+    await modal_btn.click()
+    await asyncio.sleep(2)
+    return submitted_after
+
+
 async def download_event(
     browser: NECISBrowser,
     event_id: str,
@@ -317,11 +373,15 @@ async def download_event(
 ) -> dict[str, list[Path]]:
     """Download waveforms for a single event (acceleration and/or velocity).
 
-    Uses the same queue workflow as continuous waveforms:
-      fn_file_download → sizecheck → modal → "다운로드 요청" → poll → FTP download
+    Two code paths depending on the NECIS file path format:
 
-    One queue request is submitted per data type; NECIS packages the result
-    and the history API returns the download URL when ready.
+    Old-format (wf/event/...):  Pre-2022 events where the FTP files already exist
+      as individual ZIPs.  Both a and v are bundled in one queue request via the
+      page's row checkbox + fn_calc_download_size('part').  Files are routed to
+      type-specific directories by channel band (HG/BG/LG → .a/, HH/BH/LH → .v/).
+
+    New-format (EVENT/...):  2022+ events using the queue packaging API.  One
+      Python POST request per data type; response arrives via the history API.
 
     Parameters
     ----------
@@ -332,7 +392,7 @@ async def download_event(
     out_root    : organized output root (default: cfg.download_dir/events)
     convert_sac : convert miniSEED → SAC via mseed2sac after extraction
     """
-    from .utils import organize_events_kma
+    from .utils import organize_events_kma, organize_old_event_by_channel
 
     zip_dir  = zip_dir  or (browser.cfg.download_dir / "events" / "zips")
     out_root = out_root or (browser.cfg.download_dir / "events")
@@ -351,41 +411,32 @@ async def download_event(
 
     results: dict[str, list[Path]] = {}
 
-    for dt in remaining:
-        # Navigate to event page and find the event
-        # (search is repeated per data type since fetch_ready_downloads navigates away)
-        info = await _search_event(browser, origin_time)
-        if info is None:
-            logger.warning("[%s] Event not found on NECIS — skipping %s", event_id, dt)
-            continue
+    # Search once to find the event and detect its format
+    info = await _search_event(browser, origin_time)
+    if info is None:
+        logger.warning("[%s] Event not found on NECIS — skipping", event_id)
+        return {}
 
-        necis_id = info["necis_id"]
-        dl = info["type_downloads"].get(dt)
-        if dl is None:
-            logger.warning("[%s] No fn_file_download found for type '%s'", event_id, dt)
-            continue
+    necis_id = info["necis_id"]
+    all_file_lists = [d.get("file_list", "") for d in info["type_downloads"].values()]
+    is_old_format = bool(all_file_lists) and all(fl.startswith("wf/") for fl in all_file_lists)
 
-        # Submit the download request directly from Python so we can set
-        # X-Requested-With: XMLHttpRequest — required by the server for old-format
-        # wf/event/... file paths (new-format EVENT/... paths also accept this).
-        session = await _copy_cookies_to_session(browser)
-        fdp = await browser.page.evaluate(
-            "() => typeof fileDownloadParams !== 'undefined' ? fileDownloadParams : ''"
+    if is_old_format:
+        # Old-format events (wf/event/...) reference pre-packaged FTP archives that no
+        # longer exist on the NECIS server — download attempts produce status='E' (server
+        # error) regardless of request method.  Skip and log so the caller can see which
+        # events were affected.  If NECIS restores these archives in the future, remove
+        # this block and use _submit_via_checkbox() + organize_old_event_by_channel().
+        logger.warning(
+            "[%s] NECIS event %s uses old-format paths (wf/event/...) that are no longer "
+            "accessible on the NECIS FTP server — skipping.  "
+            "Contact KMA/NECIS support if you need these waveforms.",
+            event_id, necis_id,
         )
-        # Old-format paths (wf/event/...) are legacy NECIS paths that the current
-        # /download/part/ endpoint rejects (returns HTML even with the XHR header).
-        # The /download/all/ endpoint accepts them but packages ALL sensors for the
-        # date window rather than the specific requested file, so it delivers wrong data.
-        # No automated workaround exists — skip and warn.
-        if dl["file_list"].startswith("wf/"):
-            logger.warning(
-                "[%s] Skipping '%s' — old-format path (wf/event/...) is not supported "
-                "by the current NECIS download API.  Download manually via the NECIS web UI.",
-                event_id, dt,
-            )
-            continue
+        return {}
 
-        req_size_mb = str(math.ceil(int(dl["req_size"]) / 1024 / 1024))
+    else:
+        # --- New-format: Python POST per type ---
         ajax_headers = {
             "X-Requested-With": "XMLHttpRequest",
             "Content-Type": "application/x-www-form-urlencoded",
@@ -393,65 +444,88 @@ async def download_event(
         sc_url = browser.cfg.base_url + (
             "/necis-dbf/user/fileDownload/sizecheck/part/eventwavefilesNewAjax.do"
         )
-        dl_url = browser.cfg.base_url + (
-            f"/necis-dbf/user/fileDownload/download/part/eventwavefilesNewAjax.do?{fdp}"
-        )
-        sc_params = {"fileList": dl["file_list"], "reqSize": req_size_mb,
-                     "fileCnt": "1", "chkEarth": "0"}
 
-        try:
-            sc_resp = session.post(sc_url, data=sc_params, headers=ajax_headers, timeout=30)
-            sc = sc_resp.json()
-        except Exception as e:
-            logger.error("[%s] Sizecheck failed for '%s': %s", event_id, dt, e)
-            continue
+        for dt in remaining:
+            # Re-search per type because fetch_ready_downloads navigates away
+            info = await _search_event(browser, origin_time)
+            if info is None:
+                logger.warning("[%s] Event not found on NECIS — skipping %s", event_id, dt)
+                continue
 
-        if sc.get("result") != "Y":
-            logger.warning("[%s] Sizecheck denied for '%s': %s", event_id, dt, sc.get("msg", ""))
-            continue
+            necis_id = info["necis_id"]
+            dl = info["type_downloads"].get(dt)
+            if dl is None:
+                logger.warning("[%s] No fn_file_download for type '%s'", event_id, dt)
+                continue
 
-        dl_params = {"fileList": dl["file_list"], "reqSize": sc.get("reqSize", req_size_mb),
-                     "fileCnt": "1", "chkEarth": "0"}
-        submitted_after = datetime.now()
-        try:
-            dl_resp = session.post(dl_url, data=dl_params, headers=ajax_headers, timeout=30)
-            dl_data = dl_resp.json()
-        except Exception as e:
-            logger.error("[%s] Download request failed for '%s': %s", event_id, dt, e)
-            continue
+            session = await _copy_cookies_to_session(browser)
+            fdp = await browser.page.evaluate(
+                "() => typeof fileDownloadParams !== 'undefined' ? fileDownloadParams : ''"
+            )
+            dl_url = browser.cfg.base_url + (
+                f"/necis-dbf/user/fileDownload/download/part/eventwavefilesNewAjax.do?{fdp}"
+            )
+            req_size_mb = str(math.ceil(int(dl["req_size"]) / 1024 / 1024))
+            sc_params = {
+                "fileList": dl["file_list"], "reqSize": req_size_mb,
+                "fileCnt": "1", "chkEarth": "0", "evtFileFormat": "mseed",
+            }
 
-        if dl_data.get("result") != "Y":
-            logger.warning("[%s] Download request denied for '%s': %s",
-                           event_id, dt, dl_data.get("msg", ""))
-            continue
-        logger.info("[%s] %s queued: %s", event_id, dt, dl_data.get("msg", "")[:80])
+            try:
+                sc_resp = session.post(sc_url, data=sc_params, headers=ajax_headers, timeout=30)
+                sc = sc_resp.json()
+            except Exception as e:
+                logger.error("[%s] Sizecheck failed for '%s': %s", event_id, dt, e)
+                continue
 
-        # Poll history API and download result ZIPs
-        dt_zip_dir = zip_dir / event_id / dt
-        dt_zip_dir.mkdir(parents=True, exist_ok=True)
+            if sc.get("result") != "Y":
+                logger.warning("[%s] Sizecheck denied for '%s': %s",
+                               event_id, dt, sc.get("msg", ""))
+                continue
 
-        files = await fetch_ready_downloads(
-            browser,
-            out_dir=dt_zip_dir,
-            poll_interval=30,
-            max_wait=600,
-            submitted_after=submitted_after,
-        )
-        if not files:
-            logger.warning("[%s] No files downloaded for type '%s'", event_id, dt)
-            continue
+            dl_params = {
+                "fileList": dl["file_list"], "reqSize": sc.get("reqSize", req_size_mb),
+                "fileCnt": "1", "chkEarth": "0",
+            }
+            submitted_after = datetime.now()
+            try:
+                dl_resp = session.post(dl_url, data=dl_params, headers=ajax_headers, timeout=30)
+                dl_data = dl_resp.json()
+            except Exception as e:
+                logger.error("[%s] Download request failed for '%s': %s", event_id, dt, e)
+                continue
 
-        organized = organize_events_kma(
-            zip_dir=dt_zip_dir,
-            event_utc_str=event_id,
-            necis_id=necis_id,
-            out_root=out_root,
-            data_type=dt,
-            delete_zip=True,
-            convert_sac=convert_sac,
-        )
-        results[dt] = organized
-        logger.info("[%s] %s — organized %d file(s)", event_id, dt, len(organized))
+            if dl_data.get("result") != "Y":
+                logger.warning("[%s] Download denied for '%s': %s",
+                               event_id, dt, dl_data.get("msg", ""))
+                continue
+            logger.info("[%s] %s queued: %s", event_id, dt, dl_data.get("msg", "")[:80])
+
+            dt_zip_dir = zip_dir / event_id / dt
+            dt_zip_dir.mkdir(parents=True, exist_ok=True)
+
+            files = await fetch_ready_downloads(
+                browser,
+                out_dir=dt_zip_dir,
+                poll_interval=30,
+                max_wait=600,
+                submitted_after=submitted_after,
+            )
+            if not files:
+                logger.warning("[%s] No files downloaded for type '%s'", event_id, dt)
+                continue
+
+            organized = organize_events_kma(
+                zip_dir=dt_zip_dir,
+                event_utc_str=event_id,
+                necis_id=necis_id,
+                out_root=out_root,
+                data_type=dt,
+                delete_zip=True,
+                convert_sac=convert_sac,
+            )
+            results[dt] = organized
+            logger.info("[%s] %s — organized %d file(s)", event_id, dt, len(organized))
 
     return results
 

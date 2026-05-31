@@ -272,6 +272,87 @@ def _convert_mseed_to_sac(mseed_dir: Path, sac_dir: Path) -> None:
     logger.info("Converted %d miniSEED → SAC in %s", moved, sac_dir)
 
 
+# Maps the first two characters of a NECIS channel code to data type
+_BAND_TO_TYPE: dict[str, str] = {
+    "HG": "a", "BG": "a", "LG": "a",  # acceleration (strong-motion)
+    "HH": "v", "BH": "v", "LH": "v",  # velocity (broadband)
+}
+
+
+def organize_old_event_by_channel(
+    zip_dir: Path,
+    event_utc_str: str,
+    necis_id: str,
+    out_root: Path,
+    requested_types: tuple[str, ...] = ("a", "v"),
+    delete_zip: bool = True,
+    convert_sac: bool = True,
+) -> dict[str, list[Path]]:
+    """Extract an old-format NECIS event package and route miniSEED files by channel band.
+
+    Old-format events bundle a + v waveforms in a single queue download
+    (fileList = '...a.zip|...v.zip').  This function extracts everything into a
+    staging area, then routes each file to the appropriate MSEED directory based
+    on the channel band: HG/BG/LG → .a/, HH/BH/LH → .v/.
+
+    Layout produced (same as organize_events_kma, just detected from filenames):
+      out_root/{event_utc_str}/{necis_id}.a/MSEED/  ← acceleration
+      out_root/{event_utc_str}/{necis_id}.v/MSEED/  ← velocity
+    """
+    staging = zip_dir / "_staging"
+    staging.mkdir(parents=True, exist_ok=True)
+
+    # Stage 1: extract outer ZIP(s) from the download directory
+    outer_files = extract_zips(zip_dir, staging, delete_zip=delete_zip)
+    if not outer_files:
+        logger.warning("No files extracted from %s", zip_dir)
+        shutil.rmtree(staging, ignore_errors=True)
+        return {}
+
+    # Stage 2: extract any nested ZIPs (e.g. ID.a.zip, ID.v.zip inside the outer ZIP)
+    nested_zips = [f for f in staging.iterdir() if f.suffix.lower() == ".zip" and f.exists()]
+    if nested_zips:
+        extract_zips(staging, staging, delete_zip=True)
+
+    # Stage 3: route files to type-specific MSEED directories by channel band
+    type_mseed_dirs: dict[str, Path] = {}
+    for dt in requested_types:
+        mseed_dir = out_root / event_utc_str / f"{necis_id}.{dt}" / "MSEED"
+        mseed_dir.mkdir(parents=True, exist_ok=True)
+        type_mseed_dirs[dt] = mseed_dir
+
+    routed: dict[str, list[Path]] = {dt: [] for dt in requested_types}
+    for f in sorted(staging.iterdir()):
+        if f.is_dir() or f.suffix.lower() == ".zip":
+            continue
+        parts = f.name.split(".")
+        if len(parts) < 3:
+            continue
+        band = parts[2][:2].upper()  # e.g. "HG" from "HGZ"
+        dt = _BAND_TO_TYPE.get(band)
+        if dt is None or dt not in requested_types:
+            continue
+        dest = type_mseed_dirs[dt] / f.name
+        if not dest.exists():
+            shutil.copy2(f, dest)
+        routed[dt].append(dest)
+
+    # Stage 4: SAC conversion per type
+    if convert_sac:
+        mseed2sac_ok = shutil.which(_MSEED2SAC) or Path(_MSEED2SAC).exists()
+        for dt in requested_types:
+            if not routed[dt]:
+                continue
+            sac_dir = out_root / event_utc_str / f"{necis_id}.{dt}" / "SAC"
+            if mseed2sac_ok:
+                _convert_mseed_to_sac(type_mseed_dirs[dt], sac_dir)
+            else:
+                logger.error("mseed2sac not found at %s — skipping SAC conversion", _MSEED2SAC)
+
+    shutil.rmtree(staging, ignore_errors=True)
+    return routed
+
+
 def organize_events_kma(
     zip_dir: Path,
     event_utc_str: str,
