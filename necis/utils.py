@@ -20,9 +20,13 @@ import shutil
 import subprocess
 import zipfile
 
-# bsdtar may only be in the base conda env, not the active pipeline env
-_BSDTAR   = shutil.which("bsdtar")   or "/home/msseo/miniforge3/bin/bsdtar"
-_MSEED2SAC = shutil.which("mseed2sac") or "/home/msseo/bin/mseed2sac"
+# External binaries: rely on PATH. Resolved at import; call sites should check for
+# truthy / file-existence to fail with an actionable message when actually needed.
+# Install hints:
+#   bsdtar:    apt install libarchive-tools  /  brew install libarchive  /  conda install bsdtar
+#   mseed2sac: https://github.com/iris-edu/mseed2sac (build from source) or download a release
+_BSDTAR   = shutil.which("bsdtar")
+_MSEED2SAC = shutil.which("mseed2sac")
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -89,6 +93,11 @@ def extract_zips(
                             shutil.copyfileobj(in_f, out_f)
                 logger.info("Combined: %.1f MB", combined.stat().st_size / 1e6)
 
+                if not _BSDTAR:
+                    raise RuntimeError(
+                        "bsdtar not found on PATH. Install it: "
+                        "apt install libarchive-tools  /  brew install libarchive  /  "
+                        "conda install bsdtar.")
                 result = subprocess.run(
                     [_BSDTAR, "-xvf", str(combined.resolve()),
                      "-C", str(out_dir.resolve())],
@@ -251,6 +260,11 @@ def _convert_mseed_to_sac(mseed_dir: Path, sac_dir: Path) -> None:
     if not ks_files:
         logger.warning("No KS.* files in %s — skipping SAC conversion", mseed_dir)
         return
+    if not _MSEED2SAC:
+        raise RuntimeError(
+            "mseed2sac not found on PATH. Get it from "
+            "https://github.com/iris-edu/mseed2sac (build from source) "
+            "and put the binary on your $PATH.")
     result = subprocess.run(
         [_MSEED2SAC] + [f.name for f in ks_files],
         cwd=str(mseed_dir),
@@ -400,10 +414,11 @@ def organize_events_kma(
             return []
 
     if convert_sac:
-        if shutil.which(_MSEED2SAC) or Path(_MSEED2SAC).exists():
+        if _MSEED2SAC and (shutil.which(_MSEED2SAC) or Path(_MSEED2SAC).exists()):
             _convert_mseed_to_sac(mseed_dir, sac_dir)
         else:
-            logger.error("mseed2sac not found at %s — skipping SAC conversion", _MSEED2SAC)
+            logger.error("mseed2sac not on PATH — skipping SAC conversion. Install from "
+                         "https://github.com/iris-edu/mseed2sac.")
 
     return extracted
 
