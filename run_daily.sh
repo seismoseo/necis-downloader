@@ -23,6 +23,9 @@ cd "$(dirname "$0")"
 # shellcheck disable=SC1091
 source .env 2>/dev/null || true
 
+# Cron runs with a stripped PATH; add conda base (bsdtar) and user bin (mseed2sac)
+export PATH="/home/msseo/miniforge3/bin:/home/msseo/bin:$PATH"
+
 DATE=$(date -d "2 days ago" +%Y-%m-%d)
 CONTINUOUS_DIR="${CONTINUOUS_DIR:-/home/msseo/works/Claude/data/necis/continuous}"
 
