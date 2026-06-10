@@ -100,11 +100,28 @@ async def _poll_for_ready(
     deadline = time.time() + max_wait
     cutoff = submitted_after.strftime("%Y-%m-%d %H:%M:%S") if submitted_after else None
     attempt = 0
+    _BROWSER_REFRESH_EVERY = 5  # navigate browser every N polls to keep session alive
 
     consecutive_empty = 0  # successful polls that returned no jobs at all
 
     while True:
         attempt += 1
+
+        # Keep the browser session alive by navigating the history page periodically.
+        # The requests.Session cookies are snapshots; without browser activity the
+        # server-side session expires in ~10 min.  Refreshing every 5 polls (~5 min
+        # at 60s interval) prevents expiry without a full re-login.
+        if attempt % _BROWSER_REFRESH_EVERY == 0:
+            try:
+                await browser.page.goto(
+                    browser.cfg.base_url + HISTORY_URL,
+                    wait_until="load", timeout=browser.cfg.timeout_ms,
+                )
+                await asyncio.sleep(1)
+                session = await _copy_cookies_to_session(browser)
+            except Exception as refresh_err:
+                logger.warning("[poll #%d] Browser refresh failed: %s", attempt, refresh_err)
+
         try:
             records = _fetch_history_json(session, browser.cfg.base_url)
             api_ok = True
