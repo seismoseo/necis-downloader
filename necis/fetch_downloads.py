@@ -108,6 +108,28 @@ async def _poll_for_ready(
         try:
             records = _fetch_history_json(session, browser.cfg.base_url)
             api_ok = True
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 403:
+                logger.warning(
+                    "[poll #%d] Session expired (403) — re-authenticating …", attempt
+                )
+                try:
+                    await browser._login()
+                    await browser.page.goto(
+                        browser.cfg.base_url + HISTORY_URL,
+                        wait_until="load", timeout=browser.cfg.timeout_ms,
+                    )
+                    await asyncio.sleep(2)
+                    session = await _copy_cookies_to_session(browser)
+                    logger.info("[poll #%d] Re-authenticated successfully.", attempt)
+                except Exception as login_err:
+                    logger.error("[poll #%d] Re-login failed: %s", attempt, login_err)
+            else:
+                logger.warning(
+                    "[poll #%d] History API error: %s — will retry", attempt, e
+                )
+            records = []
+            api_ok = False
         except Exception as e:
             logger.warning("[poll #%d] History API error: %s — will retry", attempt, e)
             records = []
