@@ -524,10 +524,12 @@ async def fetch_ready_downloads(
             req_id = _extract_req_id(record)
             if req_id:
                 logger.info("Using req_id=%s to filter FTP listing", req_id)
+            _raw_user = getattr(browser.cfg, "username", None)
+            _ftp_user = _raw_user.split("@")[0] if _raw_user else None
             pairs = _find_split_parts_on_ftp(
                 session, ftp_base,
                 req_id=req_id,
-                username=getattr(browser.cfg, "username", None),
+                username=_ftp_user,
                 submitted_after=submitted_after,
             )
             for z01_url, zip_url in pairs:
