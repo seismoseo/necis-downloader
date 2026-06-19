@@ -389,6 +389,40 @@ def _find_split_parts_on_ftp(
             "username=%s → matched %d file(s) in FTP listing", username, len(zip_names)
         )
 
+        # When multiple of our files are on FTP (3-day retention), narrow down by
+        # the FTP upload timestamp so we only fetch the file for this request.
+        # The Apache listing puts the timestamp in the SAME <tr> as the href.
+        if submitted_after and len(zip_names) > 1:
+            file_times: dict[str, datetime] = {}
+            for fname in zip_names:
+                m = re.search(
+                    rf'href="{re.escape(fname)}"[^<]*</a>[^\n]*'
+                    r'<td[^>]*>(\d{2}-\w{3}-\d{4}\s+\d{2}:\d{2}|\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})',
+                    html,
+                )
+                if m:
+                    ts_str = m.group(1).strip()
+                    for fmt in ("%d-%b-%Y %H:%M", "%Y-%m-%d %H:%M"):
+                        try:
+                            file_times[fname] = datetime.strptime(ts_str, fmt)
+                            break
+                        except ValueError:
+                            pass
+            filtered = [z for z in zip_names
+                        if z not in file_times or file_times[z] >= submitted_after]
+            if filtered:
+                logger.info(
+                    "Timestamp filter (cutoff=%s) narrowed %d → %d file(s)",
+                    submitted_after, len(zip_names), len(filtered),
+                )
+                zip_names = filtered
+            else:
+                logger.warning(
+                    "Timestamp filter eliminated all %d username-matched file(s) "
+                    "— keeping all matches to avoid silent failure",
+                    len(zip_names),
+                )
+
     else:
         # Last resort: timestamp filtering.  The Apache directory listing puts the
         # timestamp on the SAME table row as the href, not the next line, so the
